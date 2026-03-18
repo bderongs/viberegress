@@ -1,0 +1,1 @@
+{"configs":{"diagnostics":{"browserSDK":{"sampleRate":0.05}},"sessionReplay":{"sr_sampling_config":{"capture_enabled":true}},"analyticsSDK":{}}}

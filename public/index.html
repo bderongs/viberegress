@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VibeRegress</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@300;400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/css/app.css" />
+</head>
+<body>
+  <div id="app">
+
+    <!-- Sidebar -->
+    <aside id="sidebar">
+      <div class="logo">
+        <span class="logo-icon">◈</span>
+        <span class="logo-text">VibeRegress</span>
+      </div>
+
+      <div class="sidebar-auth-block">
+        <p class="trial-banner" id="trial-banner" hidden>
+          <span class="trial-banner-label">Trial</span>
+          <span id="trial-runs-text">2 runs left</span>
+        </p>
+        <div class="auth-user-row" id="auth-user-row">
+          <span class="auth-user-email" id="auth-user-email"></span>
+          <div class="auth-user-actions" id="auth-user-actions-anon">
+            <button type="button" class="btn-primary btn-sm" id="btn-auth-signup">Sign up</button>
+            <button type="button" class="btn-secondary btn-sm" id="btn-auth-signin">Sign in</button>
+          </div>
+          <button type="button" class="btn-secondary btn-sm hidden" id="btn-sign-out">Sign out</button>
+        </div>
+      </div>
+
+      <div class="sidebar-section">
+        <button class="btn-primary full-width" id="btn-new-site">
+          + Scan new site
+        </button>
+        <button class="btn-secondary full-width" id="btn-auth-profiles" style="margin-top: 8px;">
+          Auth profiles
+        </button>
+      </div>
+
+      <div class="sidebar-section">
+        <p class="sidebar-label">Scenarios</p>
+        <ul id="scenario-list" class="scenario-list">
+          <li class="empty-state">No scenarios yet.<br/>Scan a site to get started.</li>
+        </ul>
+      </div>
+    </aside>
+
+    <!-- Main content -->
+    <main id="main">
+
+      <!-- Welcome / scan view -->
+      <div id="view-welcome" class="view active">
+        <div class="welcome-content">
+          <h1>Catch regressions<br/><span class="accent">before your users do.</span></h1>
+          <p class="welcome-sub">Paste your site URL. VibeRegress discovers what matters, then watches for breakage on every deploy.</p>
+          <div class="scan-box">
+            <input type="url" id="scan-url" placeholder="https://your-site.com" autocomplete="off" spellcheck="false" />
+            <button class="btn-primary" id="btn-scan">Scan →</button>
+          </div>
+          <label class="scan-headless-option">
+            <input type="checkbox" id="scan-headless" checked />
+            <span>Run browser in background (headless)</span>
+          </label>
+          <details class="auth-optional" id="scan-auth-details">
+            <summary>Need a logged-in page?</summary>
+            <p class="auth-inline-hint">Use an auth profile when the site requires sign-in. <strong>Create one below</strong> (paste cookies from Chrome after you log in) or under <strong>Auth profiles</strong>, then pick it in the list.</p>
+            <details class="scan-welcome-auth-details" id="scan-welcome-auth-details">
+              <summary>Create auth profile for this URL</summary>
+              <div class="auth-profile-form panel scan-welcome-auth-form">
+                <div class="auth-form-row">
+                  <input type="url" id="scan-welcome-auth-base-url" placeholder="https://your-site.com" spellcheck="false" />
+                  <input type="text" id="scan-welcome-auth-name" placeholder="Profile name (defaults to domain)" />
+                </div>
+                <label class="auth-form-json-label auth-form-json-label-with-help" for="scan-welcome-auth-cookies-paste">
+                  <span>Paste cookies here</span>
+                  <span
+                    class="auth-help-tip"
+                    tabindex="0"
+                    data-tooltip="In Chrome: sign in to your site, press F12, open Application, choose Cookies for your site, click inside the cookie table, then Cmd/Ctrl+A and copy."
+                    aria-label="How to copy cookies from Chrome DevTools"
+                  >?</span>
+                </label>
+                <textarea id="scan-welcome-auth-cookies-paste" class="auth-form-payload" rows="4" placeholder="Full cookie table from Chrome (Name, Value, Domain columns)" aria-label="Cookie table paste"></textarea>
+                <details class="auth-advanced" id="scan-welcome-auth-advanced">
+                  <summary>Advanced (API keys, JSON, other modes)</summary>
+                  <p class="auth-form-help">Only if cookies alone are not enough.</p>
+                  <label class="auth-form-json-label" for="scan-welcome-auth-mode">How this profile authenticates</label>
+                  <select id="scan-welcome-auth-mode" class="auth-form-fullwidth">
+                    <option value="session">Cookies from the box above (default)</option>
+                    <option value="headers_cookies">Headers / JSON only (no cookie table)</option>
+                    <option value="hybrid">Cookies above plus extra headers in JSON</option>
+                  </select>
+                  <label class="auth-form-json-label" for="scan-welcome-auth-payload">JSON (optional)</label>
+                  <textarea id="scan-welcome-auth-payload" class="auth-form-payload" rows="3" placeholder='{"extraHTTPHeaders": {"Authorization": "Bearer …"}}'></textarea>
+                </details>
+                <p class="hint" id="scan-welcome-auth-hint"></p>
+                <button type="button" class="btn-primary" id="btn-scan-welcome-auth-submit">Create profile</button>
+              </div>
+            </details>
+            <div id="scan-auth-profile-row" style="display: none;">
+              <label class="auth-profile-label" for="scan-auth-profile">Auth profile for this scan</label>
+              <select id="scan-auth-profile" class="auth-profile-select">
+                <option value="">None — public pages only</option>
+              </select>
+            </div>
+            <p class="auth-inline-empty hidden" id="scan-auth-empty">No auth profile found for this URL yet. Create one below.</p>
+          </details>
+          <p class="hint" id="scan-hint"></p>
+        </div>
+      </div>
+
+      <!-- Discovery results view -->
+      <div id="view-discovery" class="view">
+        <div class="view-header">
+          <div>
+            <h2 id="discovery-title">Discovered scenarios</h2>
+            <p class="view-sub" id="discovery-url"></p>
+          </div>
+          <button class="btn-primary" id="btn-save-all">Save all scenarios</button>
+        </div>
+        <div id="discovery-list" class="scenario-cards"></div>
+      </div>
+
+      <!-- Scenario detail view -->
+      <div id="view-scenario" class="view">
+        <div class="view-header">
+          <div>
+            <h2 id="detail-name"></h2>
+            <p class="view-sub" id="detail-url"></p>
+          </div>
+          <div class="header-actions">
+            <label class="run-headless-option">
+              <input type="checkbox" id="run-headless" checked />
+              <span>Run in background (headless)</span>
+            </label>
+            <button class="btn-primary" id="btn-run">▶ Run now</button>
+          </div>
+        </div>
+
+        <section class="scenario-config panel" aria-label="Scenario configuration">
+          <p class="panel-label">Scenario configuration</p>
+          <div class="scenario-config-grid">
+            <div class="starting-webpage-row">
+              <label class="edit-scenario-label" for="detail-starting-webpage">Starting webpage</label>
+              <p class="edit-scenario-hint">Defaults to site URL if empty. Must be on the same site.</p>
+              <div class="edit-scenario-row">
+                <input type="url" id="detail-starting-webpage" class="starting-webpage-input" placeholder="" spellcheck="false" />
+                <button type="button" class="btn-secondary" id="btn-save-starting-webpage">Save</button>
+              </div>
+            </div>
+            <div>
+              <div class="scenario-auth-control" id="scenario-auth-control">
+                <div class="scenario-auth-status public" id="scenario-auth-status">
+                  <span class="scenario-auth-dot" aria-hidden="true"></span>
+                  <div class="scenario-auth-text">
+                    <span class="scenario-auth-title" id="scenario-auth-title">Public run</span>
+                    <span class="scenario-auth-subtitle" id="scenario-auth-subtitle">No auth profile set</span>
+                  </div>
+                </div>
+                <button type="button" class="btn-secondary btn-sm" id="btn-scenario-auth-change">Change</button>
+              </div>
+              <div class="scenario-auth-panel hidden" id="scenario-auth-panel">
+                <p class="edit-scenario-label">Change auth profile</p>
+                <p class="edit-scenario-hint">This affects future runs for this scenario. Pick one profile, then confirm.</p>
+                <label class="auth-profile-label visually-hidden" for="scenario-auth-select-change">Auth profile for scenario runs</label>
+                <select id="scenario-auth-select-change" class="auth-profile-select auth-form-fullwidth">
+                  <option value="">None — public run</option>
+                </select>
+                <div class="scenario-auth-panel-actions">
+                  <button type="button" class="btn-secondary btn-sm" id="btn-scenario-auth-cancel">Cancel</button>
+                  <button type="button" class="btn-primary btn-sm" id="btn-scenario-auth-apply">Apply auth change</button>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="scenario-config-actions">
+            <button class="btn-secondary" id="btn-edit-toggle">Edit</button>
+            <button class="btn-secondary" id="btn-delete">Delete</button>
+          </div>
+        </section>
+
+        <section class="edit-scenario hidden" id="edit-scenario-panel" aria-label="Edit scenario with AI">
+          <label class="edit-scenario-label" for="edit-scenario-input">Edit scenario</label>
+          <p class="edit-scenario-hint">Describe the change you want (e.g. “Don’t do that step”, “Remove step 2”, “Use ‘contact’ in the search”).</p>
+          <div class="edit-scenario-row">
+            <textarea id="edit-scenario-input" class="edit-scenario-input" rows="2" placeholder="e.g. Remove the login step"></textarea>
+            <button type="button" class="btn-primary edit-scenario-apply" id="btn-edit-apply">Apply</button>
+          </div>
+        </section>
+
+        <p class="hint" id="scenario-hint" style="display: none;"></p>
+        <div class="two-col">
+          <!-- Steps -->
+          <div class="panel">
+            <p class="panel-label">Steps</p>
+            <ol id="detail-steps" class="steps-list"></ol>
+          </div>
+
+          <!-- Live run output -->
+          <div class="panel">
+            <p class="panel-label">Run output <span id="run-status-badge"></span></p>
+            <div id="run-output" class="run-output">
+              <p class="run-idle">Hit "Run now" to execute this scenario.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Site page: scenarios + auth for one site -->
+      <div id="view-site" class="view">
+        <div class="view-header">
+          <div>
+            <h2 id="site-page-title">Site</h2>
+            <p class="view-sub" id="site-page-url"></p>
+          </div>
+          <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
+        </div>
+        <section class="edit-scenario site-create-scenario hidden" id="site-create-scenario-panel" aria-label="Create scenario with AI">
+          <label class="edit-scenario-label" for="site-create-prompt">Create scenario</label>
+          <p class="edit-scenario-hint">Describe what you want to test (e.g. "Check the pricing page", "Test login with valid credentials"). The site URL is already set.</p>
+          <div class="edit-scenario-row">
+            <textarea id="site-create-prompt" class="edit-scenario-input" rows="2" placeholder="e.g. Go to docs, search for API, open first result"></textarea>
+            <button type="button" class="btn-primary edit-scenario-apply" id="btn-site-create-apply">Create</button>
+          </div>
+          <div class="site-create-starting-webpage-block">
+            <label class="edit-scenario-label" for="site-create-starting-webpage">Starting webpage</label>
+            <p class="edit-scenario-hint">Optional. Where the scenario starts; must be on the same site. Leave as site URL to start on the homepage.</p>
+            <input type="url" id="site-create-starting-webpage" class="starting-webpage-input" placeholder="" spellcheck="false" />
+          </div>
+          <p class="hint" id="site-create-hint" style="display: none;"></p>
+        </section>
+        <section class="site-section">
+          <p class="panel-label">Scenarios</p>
+          <ul id="site-scenario-list" class="site-scenario-list"></ul>
+        </section>
+        <section class="site-section">
+          <p class="panel-label">Auth profiles for this site</p>
+          <div id="site-auth-list" class="auth-profiles-list"></div>
+          <details class="site-auth-form-details">
+            <summary>Add auth profile</summary>
+            <div class="auth-profile-form panel">
+              <p class="auth-form-help auth-cookie-intro">Log in to this site in Chrome. <kbd>F12</kbd> → <strong>Application</strong> → <strong>Cookies</strong> → this site. Select all rows in the table, copy, paste below.</p>
+              <div class="auth-form-row">
+                <input type="text" id="site-auth-form-name" placeholder="Name (e.g. My login)" />
+                <input type="url" id="site-auth-form-base-url" placeholder="Site URL" title="Usually filled from this site" />
+              </div>
+              <label class="auth-form-json-label" for="site-auth-form-cookies-paste">Paste cookies here</label>
+              <textarea id="site-auth-form-cookies-paste" class="auth-form-payload" rows="4" placeholder="Full cookie table from Chrome (Name, Value, Domain columns)" aria-label="Cookie table paste"></textarea>
+              <details class="auth-advanced" id="site-auth-form-advanced">
+                <summary>Advanced (API keys, JSON, other modes)</summary>
+                <p class="auth-form-help">Only if cookies alone are not enough. Pick a mode and/or paste JSON.</p>
+                <label class="auth-form-json-label" for="site-auth-form-mode">How this profile authenticates</label>
+                <select id="site-auth-form-mode" class="auth-form-fullwidth">
+                  <option value="session">Cookies from the box above (default)</option>
+                  <option value="headers_cookies">Headers / JSON only (no cookie table)</option>
+                  <option value="hybrid">Cookies above plus extra headers in JSON</option>
+                </select>
+                <label class="auth-form-json-label" for="site-auth-form-payload">JSON (optional)</label>
+                <textarea id="site-auth-form-payload" class="auth-form-payload" rows="3" placeholder='{"extraHTTPHeaders": {"Authorization": "Bearer …"}}'></textarea>
+              </details>
+              <p class="hint" id="site-auth-form-hint"></p>
+              <button type="button" class="btn-primary" id="btn-site-auth-submit">Create profile</button>
+            </div>
+          </details>
+        </section>
+      </div>
+
+      <!-- Auth profiles management view -->
+      <div id="view-auth-profiles" class="view view-auth-profiles">
+        <header class="auth-profiles-hero">
+          <p class="auth-profiles-eyebrow">Authentication</p>
+          <h2 class="auth-profiles-title">Use your login—without giving us your password</h2>
+          <p class="auth-profiles-lead">VibeRegress opens your app in a real browser. For pages behind sign-in, we only need a <strong>cookie copy</strong> from Chrome after <em>you</em> log in. We never ask for your password.</p>
+          <ol class="auth-profiles-steps">
+            <li><span class="auth-step-num">1</span> In Chrome, open your site and sign in normally.</li>
+            <li><span class="auth-step-num">2</span> Press <kbd>F12</kbd> → tab <strong>Application</strong> → left sidebar <strong>Cookies</strong> → click your site.</li>
+            <li><span class="auth-step-num">3</span> Click inside the cookie table, <kbd>Cmd</kbd>+<kbd>A</kbd> / <kbd>Ctrl</kbd>+<kbd>A</kbd>, then copy. Paste into the box under “New profile”.</li>
+            <li><span class="auth-step-num">4</span> When you scan or run a scenario, choose this profile so runs use your session.</li>
+          </ol>
+        </header>
+        <div class="auth-profiles-body">
+          <p class="panel-label">Your profiles</p>
+          <div class="auth-profiles-list" id="auth-profiles-list"></div>
+          <div class="auth-profile-form panel auth-profile-form-new">
+            <p class="panel-label">New profile</p>
+            <p class="auth-form-help auth-cookie-intro">Same steps as above: after login, copy the full cookie table from Chrome and paste here.</p>
+            <div class="auth-form-row">
+              <input type="text" id="auth-form-name" placeholder="Name (e.g. Work account)" />
+              <input type="url" id="auth-form-base-url" placeholder="https://your-site.com" />
+            </div>
+            <label class="auth-form-json-label" for="auth-form-cookies-paste">Paste cookies here</label>
+            <textarea id="auth-form-cookies-paste" class="auth-form-payload" rows="6" placeholder="Full table from Chrome (columns like Name, Value, Domain)" aria-label="Cookie table paste"></textarea>
+            <details class="auth-advanced" id="auth-form-advanced">
+              <summary>Advanced (API keys, JSON, other modes)</summary>
+              <p class="auth-form-help">For developers: Bearer tokens, custom headers, or hybrid cookie+header setups.</p>
+              <label class="auth-form-json-label" for="auth-form-mode">How this profile authenticates</label>
+              <select id="auth-form-mode" class="auth-form-fullwidth">
+                <option value="session">Cookies from the box above (default)</option>
+                <option value="headers_cookies">Headers / JSON only (no cookie table)</option>
+                <option value="hybrid">Cookies above plus extra headers in JSON</option>
+              </select>
+              <label class="auth-form-json-label" for="auth-form-payload">JSON (optional)</label>
+              <textarea id="auth-form-payload" class="auth-form-payload" rows="3" placeholder='{"extraHTTPHeaders": {"Authorization": "Bearer …"}}'></textarea>
+            </details>
+            <p class="hint" id="auth-form-hint"></p>
+            <button type="button" class="btn-primary" id="btn-auth-form-submit">Create profile</button>
+          </div>
+        </div>
+      </div>
+
+    </main>
+  </div>
+
+  <!-- Scanning overlay -->
+  <div id="overlay" class="overlay hidden">
+    <div class="overlay-box">
+      <div class="spinner"></div>
+      <p id="overlay-msg">Scanning site…</p>
+      <p class="overlay-sub">This may take 30–60 seconds.</p>
+    </div>
+  </div>
+
+  <!-- Auth modal -->
+  <div id="auth-overlay" class="auth-overlay hidden" aria-hidden="true">
+    <div class="auth-modal" role="dialog" aria-labelledby="auth-modal-title" aria-modal="true">
+      <button type="button" class="auth-modal-close" id="auth-modal-close" aria-label="Close">×</button>
+      <h2 class="auth-modal-title" id="auth-modal-title">Save your work</h2>
+      <p class="auth-modal-lead">Sign up to keep scenarios and runs after you close the browser. Your current trial data moves to your account.</p>
+      <div class="auth-tabs">
+        <button type="button" class="auth-tab active" data-auth-tab="signup">Sign up</button>
+        <button type="button" class="auth-tab" data-auth-tab="signin">Sign in</button>
+      </div>
+      <p class="auth-error hidden" id="auth-error"></p>
+      <form class="auth-form" id="auth-form-email" onsubmit="return false;">
+        <label class="auth-field-label" for="auth-email">Email</label>
+        <input type="email" id="auth-email" class="auth-input" autocomplete="email" required />
+        <label class="auth-field-label" for="auth-password">Password</label>
+        <input type="password" id="auth-password" class="auth-input" autocomplete="current-password" minlength="6" required />
+        <button type="submit" class="btn-primary full-width auth-submit" id="auth-submit-email">Continue</button>
+      </form>
+      <div class="auth-divider"><span>or</span></div>
+      <button type="button" class="btn-secondary full-width auth-google" id="auth-google">
+        Continue with Google
+      </button>
+      <p class="auth-hint muted" id="auth-config-hint" hidden>Configure Supabase in <code>.env</code> to enable sign in. See <code>SUPABASE_SETUP.md</code>.</p>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.49.1/dist/umd/supabase.min.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>

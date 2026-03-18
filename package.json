@@ -1,0 +1,31 @@
+{
+  "name": "viberegress",
+  "version": "0.1.0",
+  "description": "Non-regression testing for vibe coders",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "tsx src/services/step-quality.test.ts && tsx src/services/scenario-modifier.test.ts && tsx src/lib/starting-webpage.test.ts && tsx src/lib/crypto.test.ts && tsx src/lib/auth-profile-schema.test.ts && tsx src/lib/redact.test.ts"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^2.0.0",
+    "@supabase/supabase-js": "^2.49.1",
+    "better-sqlite3": "^11.6.0",
+    "express": "^4.18.2",
+    "pg": "^8.20.0",
+    "uuid": "^9.0.0",
+    "zod": "^3.22.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.18.0",
+    "@types/uuid": "^9.0.0",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.0"
+  }
+}

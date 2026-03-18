@@ -1,0 +1,1 @@
+.highlight{position:relative;display:inline;z-index:1;-webkit-box-decoration-break:clone;box-decoration-break:clone;padding:0 .1em}.highlight:after{content:"";position:absolute;bottom:0;left:0;right:0;height:30%;background-color:rgba(96,165,250,.2);z-index:-1;transform:rotate(-2deg);pointer-events:none}@media (max-width:640px){.highlight:after{transform:none;height:38%}}
