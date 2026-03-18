@@ -15,6 +15,8 @@ let supabaseClient = null;
 let accessToken = null;
 let authConfigured = false;
 let cachedUserEmail = '';
+/** @type {null | { monthlyRunsUsed?: number; monthlyRunsLimit?: number; monthlyRunsRemaining?: number; atLimit?: boolean }} */
+let monthlyUsageCache = null;
 
 function isLoggedIn() {
   return !!accessToken;
@@ -37,6 +39,7 @@ const views = {
   scenario:     $('view-scenario'),
   authProfiles: $('view-auth-profiles'),
   site:         $('view-site'),
+  account:      $('view-account'),
 };
 
 // ─── View switching ──────────────────────────────────────────────────
@@ -70,6 +73,153 @@ async function api(method, path, body) {
   return res.json();
 }
 
+/** Headers for run SSE fetches (auth matches api()). */
+function runFetchHeaders(jsonBody) {
+  const h = {};
+  if (jsonBody) h['Content-Type'] = 'application/json';
+  if (accessToken) h['Authorization'] = 'Bearer ' + accessToken;
+  else if (sessionId) h['X-Session-Id'] = sessionId;
+  return h;
+}
+
+let siteBatchRunning = false;
+/** Clears run dashboard when switching to a different site. */
+let lastSiteDashboardUrl = null;
+
+function updateSiteRunAllButton() {
+  const btn = $('btn-site-run-all');
+  if (!btn) return;
+  const siteScenarios = selectedSiteUrl
+    ? scenarios.filter(s => (s.siteUrl || '') === selectedSiteUrl)
+    : [];
+  const n = siteScenarios.length;
+  if (!n) {
+    btn.disabled = true;
+    btn.title = 'No scenarios to run';
+    return;
+  }
+  if (siteBatchRunning) {
+    btn.disabled = true;
+    btn.title = 'Batch run in progress';
+    return;
+  }
+  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+    btn.disabled = true;
+    btn.title = 'Sign up to run more scenarios';
+    return;
+  }
+  if (!isLoggedIn() && trialRunsRemaining() < n) {
+    btn.disabled = true;
+    btn.title =
+      'Trial: ' +
+      trialRunsRemaining() +
+      ' run(s) left for ' +
+      n +
+      ' scenarios — sign in to run all';
+    return;
+  }
+  if (isLoggedIn() && monthlyUsageCache && monthlyUsageCache.atLimit) {
+    btn.disabled = true;
+    btn.title = 'Monthly run limit reached — upgrade to continue';
+    return;
+  }
+  btn.disabled = false;
+  btn.title = 'Run all ' + n + ' scenario(s) one after another';
+}
+
+function runButtonStateForRunBtn() {
+  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+    return { disabled: true, title: 'Sign up to run more scenarios' };
+  }
+  if (isLoggedIn() && monthlyUsageCache && monthlyUsageCache.atLimit) {
+    return { disabled: true, title: 'Monthly run limit reached' };
+  }
+  return { disabled: false, title: '' };
+}
+
+async function refreshMonthlyUsage() {
+  if (!isLoggedIn()) {
+    monthlyUsageCache = null;
+    updateSiteRunAllButton();
+    return;
+  }
+  try {
+    monthlyUsageCache = await api('GET', '/usage');
+  } catch {
+    monthlyUsageCache = null;
+  }
+  updateSiteRunAllButton();
+}
+
+function formatPeriodResetUtc(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return (
+    d.toLocaleDateString(undefined, {
+      weekday: 'long',
+      year: 'numeric',
+      month: 'long',
+      day: 'numeric',
+      timeZone: 'UTC',
+    }) + ' (UTC)'
+  );
+}
+
+function openPaywallModal(payload) {
+  const used = payload.used ?? payload.monthlyRunsUsed ?? 0;
+  const limit = payload.limit ?? payload.monthlyRunsLimit ?? 20;
+  const body = $('paywall-body');
+  const reset = $('paywall-reset');
+  if (body) {
+    body.textContent = `You've used ${used} of ${limit} scenario runs this calendar month (UTC). Upgrade to run more.`;
+  }
+  const end = payload.periodEndExclusiveUtc || payload.periodResetsAtUtc;
+  if (reset) {
+    reset.textContent = end ? 'Your limit resets on ' + formatPeriodResetUtc(end) + '.' : '';
+  }
+  const ov = $('paywall-overlay');
+  if (ov) {
+    ov.classList.remove('hidden');
+    ov.setAttribute('aria-hidden', 'false');
+  }
+}
+
+function closePaywallModal() {
+  const ov = $('paywall-overlay');
+  if (ov) {
+    ov.classList.add('hidden');
+    ov.setAttribute('aria-hidden', 'true');
+  }
+}
+
+async function loadAccountView() {
+  const emailEl = $('account-email');
+  const lineEl = $('account-usage-line');
+  const resetEl = $('account-usage-reset');
+  if (emailEl) emailEl.textContent = cachedUserEmail || '';
+  if (!isLoggedIn()) {
+    if (lineEl) lineEl.textContent = 'Sign in to see usage.';
+    if (resetEl) resetEl.textContent = '';
+    return;
+  }
+  if (lineEl) lineEl.textContent = 'Loading…';
+  try {
+    const u = await api('GET', '/usage');
+    monthlyUsageCache = u;
+    if (lineEl) {
+      lineEl.textContent = `${u.monthlyRunsUsed} of ${u.monthlyRunsLimit} used · ${u.monthlyRunsRemaining} left`;
+    }
+    if (resetEl) {
+      resetEl.textContent = u.periodResetsAtUtc
+        ? 'Resets on ' + formatPeriodResetUtc(u.periodResetsAtUtc) + '.'
+        : '';
+    }
+  } catch {
+    if (lineEl) lineEl.textContent = 'Could not load usage.';
+    if (resetEl) resetEl.textContent = '';
+  }
+}
+
 async function initAuth() {
   try {
     const cfg = await fetch('/api/config').then(r => r.json());
@@ -95,6 +245,7 @@ async function initAuth() {
         const prev = accessToken;
         accessToken = sess?.access_token ?? null;
         cachedUserEmail = sess?.user?.email || '';
+        if (!accessToken) monthlyUsageCache = null;
         if (accessToken && !prev && sessionId) {
           try {
             await fetch('/api/auth/claim-session', {
@@ -110,6 +261,7 @@ async function initAuth() {
         }
         updateAuthChrome();
         try {
+          if (accessToken) await refreshMonthlyUsage();
           await loadScenarios();
           renderSidebarList();
           await loadAuthProfiles();
@@ -138,12 +290,14 @@ function updateAuthChrome() {
   const emailEl = $('auth-user-email');
   const btnOut = $('btn-sign-out');
   if (!banner || !runsText || !emailEl) return;
+  const btnAcct = $('btn-my-account');
   if (isLoggedIn()) {
     banner.hidden = true;
     emailEl.textContent = cachedUserEmail || 'Signed in';
     const anonActions = $('auth-user-actions-anon');
     if (anonActions) anonActions.classList.add('hidden');
     if (btnOut) btnOut.hidden = false;
+    if (btnAcct) btnAcct.classList.remove('hidden');
   } else {
     banner.hidden = false;
     const left = trialRunsRemaining();
@@ -152,6 +306,7 @@ function updateAuthChrome() {
     const anonActions = $('auth-user-actions-anon');
     if (anonActions) anonActions.classList.remove('hidden');
     if (btnOut) btnOut.hidden = true;
+    if (btnAcct) btnAcct.classList.add('hidden');
   }
 }
 
@@ -182,6 +337,23 @@ function switchAuthTab(tab) {
   });
   const sub = $('auth-submit-email');
   if (sub) sub.textContent = tab === 'signup' ? 'Create account' : 'Sign in';
+}
+
+function bindAccountUi() {
+  $('btn-my-account')?.addEventListener('click', () => {
+    showView('account');
+    void loadAccountView();
+  });
+  $('paywall-close')?.addEventListener('click', closePaywallModal);
+  $('paywall-overlay')?.addEventListener('click', e => {
+    if (e.target.id === 'paywall-overlay') closePaywallModal();
+  });
+  const paywallCta = () => {
+    closePaywallModal();
+    alert('Payments are not wired up yet — this is a placeholder.');
+  };
+  $('paywall-upgrade')?.addEventListener('click', paywallCta);
+  $('btn-account-upgrade')?.addEventListener('click', paywallCta);
 }
 
 function bindAuthUi() {
@@ -369,6 +541,22 @@ function renderSiteView() {
 
   $('site-auth-form-base-url').value = selectedSiteUrl;
   renderSiteAuthList();
+  updateSiteRunAllButton();
+  const sumEl = $('site-run-summary');
+  const dashList = $('site-run-dashboard-list');
+  if (sumEl && dashList && !siteBatchRunning) {
+    if (lastSiteDashboardUrl !== selectedSiteUrl) {
+      lastSiteDashboardUrl = selectedSiteUrl;
+      dashList.innerHTML = '';
+      if (!siteScenarios.length) sumEl.textContent = '';
+      else
+        sumEl.textContent =
+          'Click “Run all scenarios” to execute every scenario and see pass/fail here.';
+    } else if (!siteScenarios.length) {
+      dashList.innerHTML = '';
+      sumEl.textContent = '';
+    }
+  }
 }
 
 function renderSiteAuthList() {
@@ -448,6 +636,193 @@ $('btn-site-new-scenario').onclick = () => {
     $('site-create-prompt').focus();
   }
 };
+
+const btnSiteRunAll = $('btn-site-run-all');
+if (btnSiteRunAll) {
+  btnSiteRunAll.onclick = () => runAllScenariosForSite();
+}
+
+async function runAllScenariosForSite() {
+  if (!selectedSiteUrl || siteBatchRunning) return;
+  const siteScenarios = scenarios.filter(s => (s.siteUrl || '') === selectedSiteUrl);
+  if (!siteScenarios.length) return;
+
+  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+    openAuthModal();
+    switchAuthTab('signup');
+    return;
+  }
+  if (!isLoggedIn() && trialRunsRemaining() < siteScenarios.length) {
+    alert(
+      'Trial allows ' +
+        trialRunsRemaining() +
+        ' more run(s), but this site has ' +
+        siteScenarios.length +
+        ' scenarios. Sign in to run all.'
+    );
+    openAuthModal();
+    switchAuthTab('signup');
+    return;
+  }
+
+  siteBatchRunning = true;
+  const btn = $('btn-site-run-all');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+  }
+
+  const listEl = $('site-run-dashboard-list');
+  const summaryEl = $('site-run-summary');
+  const total = siteScenarios.length;
+  if (summaryEl) summaryEl.textContent = 'Starting… (0/' + total + ' complete)';
+  if (listEl) {
+    listEl.innerHTML = siteScenarios
+      .map(
+        s => `
+      <li class="site-dash-row pending" id="site-dash-${s.id}" data-scenario-id="${s.id}">
+        <div class="site-dash-row-top">
+          <span class="site-dash-status pending">pending</span>
+          <span class="site-dash-name">${escapeHtml(s.name)}</span>
+        </div>
+        <div class="site-dash-progress"></div>
+        <div class="site-dash-error"></div>
+        <div class="site-dash-trace"></div>
+      </li>`
+      )
+      .join('');
+  }
+
+  const headlessEl = $('run-headless');
+  const headless = headlessEl ? headlessEl.checked : false;
+  const path = '/sites/' + encodeURIComponent(selectedSiteUrl) + '/run-all';
+
+  let completed = 0;
+  let hitMonthlyPaywall = false;
+  try {
+    const res = await fetch('/api' + path, {
+      method: 'POST',
+      headers: runFetchHeaders(true),
+      body: JSON.stringify({ headless }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || res.statusText);
+    }
+    if (!res.body) throw new Error('No response body');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    outer: while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        let ev;
+        try {
+          ev = JSON.parse(line.slice(6));
+        } catch {
+          continue;
+        }
+        if (ev.type === 'monthlyLimitExceeded') {
+          hitMonthlyPaywall = true;
+          monthlyUsageCache = {
+            monthlyRunsUsed: ev.used,
+            monthlyRunsLimit: ev.limit,
+            monthlyRunsRemaining: 0,
+            atLimit: true,
+          };
+          openPaywallModal(ev);
+          break outer;
+        }
+        if (ev.type === 'batchStart' && summaryEl) {
+          summaryEl.textContent = 'Running… (0/' + (ev.total || total) + ' complete)';
+        }
+        if (ev.type === 'scenarioStart') {
+          const row = $('site-dash-' + ev.scenarioId);
+          if (row) {
+            row.className = 'site-dash-row running';
+            row.dataset.stepCount = String(ev.stepCount || 0);
+            const st = row.querySelector('.site-dash-status');
+            const pr = row.querySelector('.site-dash-progress');
+            if (st) {
+              st.className = 'site-dash-status running';
+              st.textContent = 'running';
+            }
+            if (pr) pr.textContent = 'Step 1 / ' + (ev.stepCount || '?') + '…';
+          }
+        }
+        if (ev.type === 'step' && ev.scenarioId != null) {
+          const row = $('site-dash-' + ev.scenarioId);
+          const nSteps = Number(row && row.dataset.stepCount) || 0;
+          const pr = row && row.querySelector('.site-dash-progress');
+          if (pr && ev.status === 'pass' && nSteps) {
+            const doneSteps = ev.index + 1;
+            if (doneSteps >= nSteps) pr.textContent = 'All ' + nSteps + ' steps completed';
+            else pr.textContent = 'Step ' + (doneSteps + 1) + ' / ' + nSteps + '…';
+          }
+          if (pr && ev.status === 'fail') {
+            pr.textContent = 'Stopped at step ' + (ev.index + 1) + ' / ' + (nSteps || '?');
+            const errEl = row.querySelector('.site-dash-error');
+            if (errEl && ev.error) errEl.textContent = ev.error;
+          }
+        }
+        if (ev.type === 'scenarioDone') {
+          completed += 1;
+          if (summaryEl) {
+            summaryEl.textContent =
+              'Progress: ' + completed + '/' + total + ' scenario(s) finished';
+          }
+          if (!isLoggedIn()) {
+            sessionStorage.setItem(TRIAL_RUNS_KEY, String(trialRunsUsed() + 1));
+            updateAuthChrome();
+          }
+          const row = $('site-dash-' + ev.scenarioId);
+          if (row) {
+            row.className = 'site-dash-row ' + ev.status;
+            const st = row.querySelector('.site-dash-status');
+            if (st) {
+              st.className = 'site-dash-status ' + ev.status;
+              st.textContent = ev.status;
+            }
+            const errEl = row.querySelector('.site-dash-error');
+            if (errEl && ev.error && ev.status === 'fail') errEl.textContent = ev.error;
+            const tr = row.querySelector('.site-dash-trace');
+            if (tr && ev.traceUrl) {
+              tr.innerHTML =
+                '<a href="' +
+                escapeHtml(ev.traceUrl) +
+                '" download="trace.zip">Download trace</a>';
+            }
+          }
+        }
+        if (ev.type === 'batchDone' && summaryEl) {
+          summaryEl.textContent =
+            'Done: ' + ev.passed + ' passed, ' + ev.failed + ' failed (of ' + ev.total + ')';
+        }
+      }
+    }
+  } catch (e) {
+    if (summaryEl) summaryEl.textContent = 'Error: ' + (e && e.message ? e.message : String(e));
+    alert('Run all failed: ' + (e && e.message ? e.message : String(e)));
+  } finally {
+    if (hitMonthlyPaywall && summaryEl) {
+      summaryEl.textContent =
+        (summaryEl.textContent || '') + ' — monthly run limit reached; remaining scenarios were not run.';
+    }
+    siteBatchRunning = false;
+    if (btn) btn.textContent = 'Run all scenarios';
+    updateSiteRunAllButton();
+    try {
+      await loadScenarios();
+      renderSidebarList();
+      if (views.site && views.site.classList.contains('active')) renderSiteView();
+    } catch (_) {}
+  }
+}
 
 function normalizedUrlFromScanField() {
   return normalizeUrlInput(($('scan-url') && $('scan-url').value.trim()) || '');
@@ -877,6 +1252,8 @@ async function openScenario(id) {
   const s = scenarios.find(x => x.id === id);
   if (!s) return;
 
+  if (isLoggedIn()) await refreshMonthlyUsage();
+
   $('detail-name').textContent = s.name;
   $('detail-url').textContent = s.siteUrl;
 
@@ -982,9 +1359,9 @@ async function openScenario(id) {
   }
   const runBtn = $('btn-run');
   if (runBtn) {
-    runBtn.disabled = !isLoggedIn() && trialRunsUsed() >= 2;
-    runBtn.title =
-      !isLoggedIn() && trialRunsUsed() >= 2 ? 'Sign up to run more scenarios' : '';
+    const st = runButtonStateForRunBtn();
+    runBtn.disabled = st.disabled;
+    runBtn.title = st.title;
   }
 
   if (applyBtn && panel && selectEl) {
@@ -1054,8 +1431,9 @@ function resetRunOutput() {
   $('run-status-badge').innerHTML = '';
   const rb = $('btn-run');
   if (rb) {
-    rb.disabled = !isLoggedIn() && trialRunsUsed() >= 2;
-    rb.title = !isLoggedIn() && trialRunsUsed() >= 2 ? 'Sign up to run more scenarios' : '';
+    const st = runButtonStateForRunBtn();
+    rb.disabled = st.disabled;
+    rb.title = st.title;
     rb.textContent = '▶ Run now';
   }
 }
@@ -1147,9 +1525,30 @@ async function runActiveScenario() {
   const authProfileId = scenario.authProfileId || undefined;
   const res = await fetch(`/api/scenarios/${activeScenarioId}/run`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: runFetchHeaders(true),
     body: JSON.stringify({ headless, ...(authProfileId && { authProfileId }) }),
   });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    if (res.status === 402 && err.error === 'monthly_limit_exceeded') {
+      monthlyUsageCache = {
+        monthlyRunsUsed: err.used,
+        monthlyRunsLimit: err.limit,
+        monthlyRunsRemaining: err.remaining ?? 0,
+        atLimit: true,
+      };
+      openPaywallModal(err);
+    } else {
+      alert(err.error || res.statusText || 'Run failed');
+    }
+    resetRunOutput();
+    return;
+  }
+  if (!res.body) {
+    alert('No response body');
+    resetRunOutput();
+    return;
+  }
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
 
@@ -1199,13 +1598,26 @@ function handleRunEvent(event, scenario, currentRunId) {
       const n = trialRunsUsed() + 1;
       sessionStorage.setItem(TRIAL_RUNS_KEY, String(n));
       updateAuthChrome();
+    } else {
+      void refreshMonthlyUsage().then(() => {
+        const rb2 = $('btn-run');
+        if (rb2) {
+          const st = runButtonStateForRunBtn();
+          rb2.disabled = st.disabled;
+          rb2.title = st.title;
+          rb2.textContent = '▶ Run again';
+        }
+        if (views.account && views.account.classList.contains('active')) void loadAccountView();
+      });
     }
     const badge = $('run-status-badge');
     badge.innerHTML = `<span class="badge ${event.status}">${event.status}</span>`;
     const rb2 = $('btn-run');
-    if (rb2) {
+    if (rb2 && !isLoggedIn()) {
       rb2.disabled = !isLoggedIn() && trialRunsUsed() >= 2;
       rb2.title = !isLoggedIn() && trialRunsUsed() >= 2 ? 'Sign up to run more scenarios' : '';
+      rb2.textContent = '▶ Run again';
+    } else if (rb2 && isLoggedIn()) {
       rb2.textContent = '▶ Run again';
     }
 
@@ -1474,7 +1886,9 @@ const RUN_HEADLESS_KEY = 'viberegress_run_headless';
 
 (async () => {
   bindAuthUi();
+  bindAccountUi();
   await initAuth();
+  if (isLoggedIn()) await refreshMonthlyUsage();
   try {
     await loadScenarios();
     await loadAuthProfiles();

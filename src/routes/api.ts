@@ -31,6 +31,36 @@ import type { Owner } from '../types/owner.js';
 const SESSION_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
+const MONTHLY_RUN_LIMIT = 20;
+
+function utcMonthWindow(): { periodStartUtc: string; periodEndExclusiveUtc: string } {
+  const y = new Date().getUTCFullYear();
+  const m = new Date().getUTCMonth();
+  const periodStartUtc = new Date(Date.UTC(y, m, 1, 0, 0, 0, 0)).toISOString();
+  const periodEndExclusiveUtc = new Date(Date.UTC(y, m + 1, 1, 0, 0, 0, 0)).toISOString();
+  return { periodStartUtc, periodEndExclusiveUtc };
+}
+
+async function getSignedInMonthlyUsage(userId: string) {
+  const { periodStartUtc, periodEndExclusiveUtc } = utcMonthWindow();
+  const used = await getRunRepository().countRunsForUserInUtcMonth(
+    userId,
+    periodStartUtc,
+    periodEndExclusiveUtc
+  );
+  const limit = MONTHLY_RUN_LIMIT;
+  const remaining = Math.max(0, limit - used);
+  return {
+    used,
+    limit,
+    remaining,
+    periodStartUtc,
+    periodEndExclusiveUtc,
+    periodResetsAtUtc: periodEndExclusiveUtc,
+    atLimit: used >= limit,
+  };
+}
+
 export const router = Router();
 
 router.get('/config', (_req: Request, res: Response) => {
@@ -53,6 +83,32 @@ router.get('/auth/me', (req: Request, res: Response) => {
       o.type === 'user' && req.authUser
         ? { id: req.authUser.id, email: req.authUser.email ?? null }
         : null,
+  });
+});
+
+router.get('/usage', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.json({
+      isAnonymous: true,
+      monthlyRunsUsed: null,
+      monthlyRunsLimit: null,
+      monthlyRunsRemaining: null,
+      periodStartUtc: null,
+      periodResetsAtUtc: null,
+      atLimit: false,
+      checkoutUrl: '/billing',
+    });
+  }
+  const u = await getSignedInMonthlyUsage(req.owner!.id);
+  res.json({
+    isAnonymous: false,
+    monthlyRunsUsed: u.used,
+    monthlyRunsLimit: u.limit,
+    monthlyRunsRemaining: u.remaining,
+    periodStartUtc: u.periodStartUtc,
+    periodResetsAtUtc: u.periodResetsAtUtc,
+    atLimit: u.atLimit,
+    checkoutUrl: '/billing',
   });
 });
 
@@ -522,23 +578,18 @@ router.post('/scenarios', async (req: Request, res: Response) => {
   res.json(saved);
 });
 
-router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
-  const scenario = await getScenarioRepository().getById(req.params.id, req.owner!);
-  if (!scenario) return res.status(404).json({ error: 'Not found' });
+function normalizeSiteUrlForMatch(url: string): string {
+  return (url || '').replace(/\/$/, '');
+}
 
-  const { headless, authProfileId: requestAuthProfileId } = req.body as {
-    headless?: boolean;
-    authProfileId?: string;
-  };
-  const headlessOpt = headless !== undefined ? headless : undefined;
-  const authProfileId = requestAuthProfileId ?? scenario.authProfileId ?? undefined;
-
-  res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
-  res.setHeader('Connection', 'keep-alive');
-
-  const send = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
+async function executeScenarioRunPipeline(
+  scenario: Scenario,
+  owner: Owner,
+  opts: { headless?: boolean; authProfileId?: string | undefined },
+  emitStep: (p: { index: number; status: string; error?: string; durationMs?: number }) => void,
+  onRunReady: (run: TestRun) => void,
+  ctx: { requestId?: string; traceId?: string }
+): Promise<{ run: TestRun; clientError: string | undefined; traceUrl: string | undefined }> {
   const runId = uuidv4();
   const run: TestRun = {
     id: runId,
@@ -564,84 +615,88 @@ router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
       scenarioId: scenario.id,
       scenarioName: scenario.name,
       stepCount: scenario.steps.length,
-      headless: headlessOpt,
-      authProfileId: authProfileId ?? null,
+      headless: opts.headless,
+      authProfileId: opts.authProfileId ?? null,
     },
     'run',
     'info',
-    { runId, scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
+    { runId, scenarioId: scenario.id, requestId: ctx.requestId, traceId: ctx.traceId }
   );
 
-  send({ type: 'start', run });
+  onRunReady(run);
 
-  const telemetryCtx = { runId, scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId };
+  const telemetryCtx = { runId, scenarioId: scenario.id, requestId: ctx.requestId, traceId: ctx.traceId };
   let passed = false;
   let error: string | undefined;
   let tracePath: string | undefined;
   const startUrl = scenario.startingWebpage?.trim() || scenario.siteUrl;
   try {
     const result = await runScenario(
-    startUrl,
-    scenario.steps,
-    (index, status, stepError, durationMs) => {
-      const step = scenario.steps[index];
-      run.steps[index] = {
-        instruction: step.instruction,
-        status,
-        type: step.type,
-        error: stepError,
-        durationMs,
-      };
-      void Promise.resolve(getRunRepository().save(run)).catch(() => undefined);
-      writeArtifact({
-        runId,
-        stepIndex: index,
-        name: 'step-result',
-        content: JSON.stringify({
+      startUrl,
+      scenario.steps,
+      (index, status, stepError, durationMs) => {
+        const step = scenario.steps[index];
+        run.steps[index] = {
           instruction: step.instruction,
-          type: step.type,
           status,
-          durationMs: durationMs ?? null,
-          error: stepError ?? null,
-        }, null, 2),
-        mimeType: 'application/json',
-      });
-      if (status === 'pass') {
-        emitTelemetry(
-          { eventType: 'run_step_completed', stepIndex: index, durationMs: durationMs ?? 0 },
-          'run',
-          'info',
-          telemetryCtx
-        );
-      } else {
-        emitTelemetry(
-          {
-            eventType: 'run_step_failed',
-            stepIndex: index,
-            error: stepError ?? 'Unknown error',
-            durationMs: durationMs ?? 0,
-          },
-          'run',
-          'warn',
-          telemetryCtx
-        );
-      }
-      send({ type: 'step', index, status, error: stepError, durationMs });
-    },
-    {
-      runId,
-      headless: headlessOpt,
-      authProfileId,
-      owner: req.owner!,
-      onStepStart(index, instruction, stepType) {
-        emitTelemetry(
-          { eventType: 'run_step_started', stepIndex: index, instruction, stepType },
-          'run',
-          'info',
-          telemetryCtx
-        );
+          type: step.type,
+          error: stepError,
+          durationMs,
+        };
+        void Promise.resolve(getRunRepository().save(run)).catch(() => undefined);
+        writeArtifact({
+          runId,
+          stepIndex: index,
+          name: 'step-result',
+          content: JSON.stringify(
+            {
+              instruction: step.instruction,
+              type: step.type,
+              status,
+              durationMs: durationMs ?? null,
+              error: stepError ?? null,
+            },
+            null,
+            2
+          ),
+          mimeType: 'application/json',
+        });
+        if (status === 'pass') {
+          emitTelemetry(
+            { eventType: 'run_step_completed', stepIndex: index, durationMs: durationMs ?? 0 },
+            'run',
+            'info',
+            telemetryCtx
+          );
+        } else {
+          emitTelemetry(
+            {
+              eventType: 'run_step_failed',
+              stepIndex: index,
+              error: stepError ?? 'Unknown error',
+              durationMs: durationMs ?? 0,
+            },
+            'run',
+            'warn',
+            telemetryCtx
+          );
+        }
+        emitStep({ index, status, error: stepError, durationMs });
       },
-    }
+      {
+        runId,
+        headless: opts.headless,
+        authProfileId: opts.authProfileId,
+        owner,
+        onStepStart(index, instruction, stepType) {
+          emitTelemetry(
+            { eventType: 'run_step_started', stepIndex: index, instruction, stepType },
+            'run',
+            'info',
+            telemetryCtx
+          );
+        },
+      }
     );
     passed = result.passed;
     error = result.error;
@@ -654,7 +709,7 @@ router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
   run.finishedAt = new Date().toISOString();
   run.error = error;
   await getRunRepository().save(run);
-  await getScenarioRepository().updateStatus(scenario.id, passed ? 'pass' : 'fail', run.finishedAt, req.owner!);
+  await getScenarioRepository().updateStatus(scenario.id, passed ? 'pass' : 'fail', run.finishedAt, owner);
 
   const traceUrl = tracePath ? `/api/runs/${runId}/trace` : undefined;
   const clientError = error ? redactAuth(error) : undefined;
@@ -684,17 +739,160 @@ router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
     emitTelemetry({ eventType: 'run_completed', status: 'pass' }, 'run', 'info', {
       runId,
       scenarioId: scenario.id,
-      requestId: req.requestId,
-      traceId: req.traceId,
+      requestId: ctx.requestId,
+      traceId: ctx.traceId,
     });
   } else {
     emitTelemetry(
       { eventType: 'run_failed', status: 'fail', error: redactAuth(error ?? 'Unknown') },
       'run',
       'warn',
-      { runId, scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
+      { runId, scenarioId: scenario.id, requestId: ctx.requestId, traceId: ctx.traceId }
     );
   }
+
+  return { run, clientError, traceUrl };
+}
+
+router.post('/sites/:siteUrl/run-all', async (req: Request, res: Response) => {
+  let siteUrlDecoded: string;
+  try {
+    siteUrlDecoded = decodeURIComponent(req.params.siteUrl);
+  } catch {
+    return res.status(400).json({ error: 'Invalid site URL' });
+  }
+  const target = normalizeSiteUrlForMatch(siteUrlDecoded);
+  const all = await getScenarioRepository().getAll(req.owner!);
+  const forSite = all.filter(s => normalizeSiteUrlForMatch(s.siteUrl || '') === target);
+  if (!forSite.length) {
+    return res.status(404).json({ error: 'No scenarios for this site' });
+  }
+
+  const { headless } = req.body as { headless?: boolean };
+  const headlessOpt = headless !== undefined ? headless : undefined;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const send = (data: object) => {
+    if (!res.writableEnded) res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  const ctx = { requestId: req.requestId, traceId: req.traceId };
+  send({
+    type: 'batchStart',
+    total: forSite.length,
+    scenarios: forSite.map(s => ({ id: s.id, name: s.name })),
+  });
+
+  let passedCount = 0;
+  let failedCount = 0;
+
+  for (const scenario of forSite) {
+    if (req.owner!.type === 'user') {
+      const usage = await getSignedInMonthlyUsage(req.owner!.id);
+      if (usage.atLimit) {
+        send({
+          type: 'monthlyLimitExceeded',
+          scenarioId: scenario.id,
+          error: 'monthly_limit_exceeded',
+          used: usage.used,
+          limit: usage.limit,
+          remaining: usage.remaining,
+          periodStartUtc: usage.periodStartUtc,
+          periodEndExclusiveUtc: usage.periodEndExclusiveUtc,
+          checkoutUrl: '/billing',
+        });
+        break;
+      }
+    }
+    const authProfileId = scenario.authProfileId ?? undefined;
+    const { run, clientError, traceUrl } = await executeScenarioRunPipeline(
+      scenario,
+      req.owner!,
+      { headless: headlessOpt, authProfileId },
+      p =>
+        send({
+          type: 'step',
+          scenarioId: scenario.id,
+          index: p.index,
+          status: p.status,
+          error: p.error,
+          durationMs: p.durationMs,
+        }),
+      runReady =>
+        send({
+          type: 'scenarioStart',
+          scenarioId: scenario.id,
+          scenarioName: scenario.name,
+          runId: runReady.id,
+          stepCount: runReady.steps.length,
+        }),
+      ctx
+    );
+    if (run.status === 'pass') passedCount += 1;
+    else failedCount += 1;
+    send({
+      type: 'scenarioDone',
+      scenarioId: scenario.id,
+      runId: run.id,
+      status: run.status,
+      error: clientError,
+      traceUrl: traceUrl ?? undefined,
+    });
+  }
+
+  send({
+    type: 'batchDone',
+    total: forSite.length,
+    passed: passedCount,
+    failed: failedCount,
+  });
+  res.end();
+});
+
+router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
+  const scenario = await getScenarioRepository().getById(req.params.id, req.owner!);
+  if (!scenario) return res.status(404).json({ error: 'Not found' });
+
+  if (req.owner!.type === 'user') {
+    const usage = await getSignedInMonthlyUsage(req.owner!.id);
+    if (usage.atLimit) {
+      return res.status(402).json({
+        error: 'monthly_limit_exceeded',
+        used: usage.used,
+        limit: usage.limit,
+        remaining: usage.remaining,
+        periodStartUtc: usage.periodStartUtc,
+        periodEndExclusiveUtc: usage.periodEndExclusiveUtc,
+        checkoutUrl: '/billing',
+      });
+    }
+  }
+
+  const { headless, authProfileId: requestAuthProfileId } = req.body as {
+    headless?: boolean;
+    authProfileId?: string;
+  };
+  const headlessOpt = headless !== undefined ? headless : undefined;
+  const authProfileId = requestAuthProfileId ?? scenario.authProfileId ?? undefined;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const send = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  const ctx = { requestId: req.requestId, traceId: req.traceId };
+  const { run, clientError, traceUrl } = await executeScenarioRunPipeline(
+    scenario,
+    req.owner!,
+    { headless: headlessOpt, authProfileId },
+    p => send({ type: 'step', index: p.index, status: p.status, error: p.error, durationMs: p.durationMs }),
+    runReady => send({ type: 'start', run: runReady }),
+    ctx
+  );
 
   send({ type: 'done', status: run.status, error: clientError, traceUrl: traceUrl ?? undefined });
   res.end();

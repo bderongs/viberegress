@@ -91,6 +91,23 @@ export function createRunRepository(): RunRepository {
       );
       return result.rows.map(rowToRun);
     },
+
+    async countRunsForUserInUtcMonth(
+      userId: string,
+      periodStartUtc: string,
+      periodEndExclusiveUtc: string
+    ): Promise<number> {
+      const result = await pool.query<{ c: string }>(
+        `SELECT COUNT(*)::text AS c
+         FROM runs r
+         INNER JOIN scenarios s ON s.id = r.scenario_id
+         WHERE s.owner_type = 'user' AND s.owner_id = $1
+           AND r.started_at >= $2 AND r.started_at < $3`,
+        [userId, periodStartUtc, periodEndExclusiveUtc]
+      );
+      const row = result.rows[0];
+      return row ? parseInt(row.c, 10) || 0 : 0;
+    },
   };
 }
 

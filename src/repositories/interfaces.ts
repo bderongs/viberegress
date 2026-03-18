@@ -42,6 +42,12 @@ export interface RunRepository {
   save(run: TestRun): MaybePromise<void>;
   getById(id: string): MaybePromise<TestRun | undefined>;
   getByScenarioId(scenarioId: string): MaybePromise<TestRun[]>;
+  /** Count runs whose scenarios belong to this user, started in [periodStartUtc, periodEndExclusiveUtc). */
+  countRunsForUserInUtcMonth(
+    userId: string,
+    periodStartUtc: string,
+    periodEndExclusiveUtc: string
+  ): MaybePromise<number>;
 }
 
 export interface TelemetryEventRepository {

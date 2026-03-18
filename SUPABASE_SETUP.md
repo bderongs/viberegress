@@ -17,3 +17,5 @@
    - Paste Client ID and Client Secret into Supabase.
 
 Restart the VibeRegress server after changing `.env`.
+
+**Usage:** Signed-in users get **20 scenario runs per calendar month (UTC)**. Usage is derived from `runs` joined to owned `scenarios`. `GET /api/usage` returns the current counts for the **My account** page.

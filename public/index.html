@@ -40,6 +40,9 @@
         <button class="btn-secondary full-width" id="btn-auth-profiles" style="margin-top: 8px;">
           Auth profiles
         </button>
+        <button type="button" class="btn-secondary full-width hidden" id="btn-my-account" style="margin-top: 8px;">
+          My account
+        </button>
       </div>
 
       <div class="sidebar-section">
@@ -213,13 +216,23 @@
 
       <!-- Site page: scenarios + auth for one site -->
       <div id="view-site" class="view">
-        <div class="view-header">
+        <div class="view-header site-view-header">
           <div>
             <h2 id="site-page-title">Site</h2>
             <p class="view-sub" id="site-page-url"></p>
           </div>
-          <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
+          <div class="site-view-actions">
+            <button type="button" class="btn-secondary" id="btn-site-run-all" title="">Run all scenarios</button>
+            <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
+          </div>
         </div>
+        <section class="site-section site-run-dashboard" id="site-run-dashboard" aria-live="polite">
+          <div class="site-run-dashboard-head">
+            <p class="panel-label">Run dashboard</p>
+            <p class="site-run-summary" id="site-run-summary"></p>
+          </div>
+          <ul id="site-run-dashboard-list" class="site-run-dashboard-list"></ul>
+        </section>
         <section class="edit-scenario site-create-scenario hidden" id="site-create-scenario-panel" aria-label="Create scenario with AI">
           <label class="edit-scenario-label" for="site-create-prompt">Create scenario</label>
           <p class="edit-scenario-hint">Describe what you want to test (e.g. "Check the pricing page", "Test login with valid credentials"). The site URL is already set.</p>
@@ -267,6 +280,22 @@
               <button type="button" class="btn-primary" id="btn-site-auth-submit">Create profile</button>
             </div>
           </details>
+        </section>
+      </div>
+
+      <!-- My account -->
+      <div id="view-account" class="view">
+        <div class="view-header">
+          <div>
+            <h2>My account</h2>
+            <p class="view-sub" id="account-email"></p>
+          </div>
+        </div>
+        <section class="panel account-usage-panel">
+          <p class="panel-label">Scenario runs this month (UTC)</p>
+          <p id="account-usage-line" class="account-usage-line">—</p>
+          <p id="account-usage-reset" class="hint"></p>
+          <button type="button" class="btn-primary" id="btn-account-upgrade">Upgrade (coming soon)</button>
         </section>
       </div>
 
@@ -322,6 +351,17 @@
       <div class="spinner"></div>
       <p id="overlay-msg">Scanning site…</p>
       <p class="overlay-sub">This may take 30–60 seconds.</p>
+    </div>
+  </div>
+
+  <!-- Paywall placeholder (monthly limit) -->
+  <div id="paywall-overlay" class="auth-overlay hidden" aria-hidden="true">
+    <div class="auth-modal paywall-modal" role="dialog" aria-labelledby="paywall-title" aria-modal="true">
+      <button type="button" class="auth-modal-close" id="paywall-close" aria-label="Close">×</button>
+      <h2 class="auth-modal-title" id="paywall-title">Monthly run limit reached</h2>
+      <p class="auth-modal-lead" id="paywall-body"></p>
+      <p class="auth-hint muted" id="paywall-reset"></p>
+      <button type="button" class="btn-primary full-width" id="paywall-upgrade">Upgrade (coming soon)</button>
     </div>
   </div>
 
