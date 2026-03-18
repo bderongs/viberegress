@@ -1,6 +1,6 @@
 /**
  * Assembles full run context (run, scenario snapshot, events, steps, artifacts) for a given runId.
- * Used for LLM failure analysis: query SQLite or call this to get forensic context.
+ * Used for LLM failure analysis: query repositories or call this helper for full forensic context.
  */
 
 import path from 'path';

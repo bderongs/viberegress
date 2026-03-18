@@ -1,6 +1,6 @@
 /**
  * Repository interfaces for scenario, run, telemetry, artifact, and discovery persistence.
- * Implementations are SQLite-based; interfaces allow future swap to Postgres/Supabase.
+ * Implementations are Postgres-based; interfaces keep services decoupled from storage specifics.
  */
 
 import type {

@@ -8,8 +8,7 @@ import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 import { router } from './routes/api.js';
 import { logger } from './lib/logger.js';
-import { getDb } from './lib/db.js';
-import { hasPostgresConfig } from './lib/postgres.js';
+import { getPgPool } from './lib/postgres.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -28,9 +27,7 @@ app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, '../public/index.html'));
 });
 
-if (!hasPostgresConfig()) {
-  getDb(); // Ensure SQLite DB and migrations are ready in fallback mode.
-}
+getPgPool(); // Ensure Postgres config is validated at startup.
 app.listen(PORT, () => {
   logger.info('VibeRegress running', { port: PORT, url: `http://localhost:${PORT}` });
 });

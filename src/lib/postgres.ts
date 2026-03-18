@@ -15,10 +15,6 @@ function getConnectionString(): string {
   return value;
 }
 
-export function hasPostgresConfig(): boolean {
-  return Boolean(process.env.SUPABASE_DB_URL ?? process.env.POSTGRES_URL);
-}
-
 export function getPgPool(): Pool {
   if (pool) return pool;
   const connectionString = getConnectionString();

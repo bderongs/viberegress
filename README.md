@@ -9,7 +9,7 @@ Paste a URL → AI discovers your key user scenarios → run them anytime to cat
 - **Stagehand** (Browserbase) — AI-powered browser automation
 - **Express** + TypeScript — backend API
 - **Vanilla JS** — frontend (no framework)
-- **Supabase Postgres** — persistent app data (with SQLite fallback if Postgres env is not set)
+- **Supabase Postgres** — persistent app data
 
 ---
 
@@ -97,7 +97,6 @@ public/
 
 ## Next steps (post-MVP)
 
-- [ ] Persist scenarios to SQLite with `better-sqlite3`
 - [ ] Schedule runs (cron) with `node-cron`
 - [ ] Screenshot capture on failure
 - [ ] Email/Slack alerts
