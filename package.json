@@ -8,7 +8,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsx src/services/step-quality.test.ts && tsx src/services/scenario-modifier.test.ts && tsx src/lib/starting-webpage.test.ts && tsx src/lib/crypto.test.ts && tsx src/lib/auth-profile-schema.test.ts && tsx src/lib/redact.test.ts"
+    "test": "tsx src/services/step-quality.test.ts && tsx src/services/scenario-modifier.test.ts && tsx src/lib/starting-webpage.test.ts && tsx src/lib/crypto.test.ts && tsx src/lib/auth-profile-schema.test.ts && tsx src/lib/redact.test.ts && tsx src/lib/site-share.test.ts"
   },
   "dependencies": {
     "@browserbasehq/stagehand": "^2.0.0",

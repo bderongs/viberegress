@@ -9,6 +9,11 @@ let discoveredScenarios = null;
 let authProfiles = [];
 let authProfileValidity = new Map();
 let activeStepEditIndex = null;
+let activeAddStepIndex = null;
+/** Cached run UI per scenario id so we can preserve results across tab switches. */
+let runUiCacheByScenarioId = new Map();
+/** Scenario id whose run is currently in progress (best-effort; see run UI updates). */
+let runInProgressScenarioId = null;
 
 let sessionId = null;
 let supabaseClient = null;
@@ -34,18 +39,32 @@ function trialRunsRemaining() {
 const $ = id => document.getElementById(id);
 
 const views = {
-  welcome:      $('view-welcome'),
-  discovery:    $('view-discovery'),
-  scenario:     $('view-scenario'),
-  authProfiles: $('view-auth-profiles'),
-  site:         $('view-site'),
-  account:      $('view-account'),
+  welcome:        $('view-welcome'),
+  discovery:      $('view-discovery'),
+  scenario:       $('view-scenario'),
+  authProfiles:   $('view-auth-profiles'),
+  site:           $('view-site'),
+  account:        $('view-account'),
+  sharedSite:     $('view-shared-site'),
+  sharedScenario: $('view-shared-scenario'),
 };
+
+let shareTokenActive = null;
+let sharedSiteScenarios = [];
+let activeSharedScenario = null;
+
+function parseSharePath() {
+  const m = /^\/share\/([^/]+)\/?$/.exec(window.location.pathname || '');
+  return m ? m[1] : null;
+}
 
 // ─── View switching ──────────────────────────────────────────────────
 function showView(name) {
-  Object.values(views).forEach(v => v.classList.remove('active'));
-  views[name].classList.add('active');
+  Object.values(views).forEach(v => {
+    if (v) v.classList.remove('active');
+  });
+  const v = views[name];
+  if (v) v.classList.add('active');
 }
 
 // ─── Overlay ─────────────────────────────────────────────────────────
@@ -192,6 +211,54 @@ function closePaywallModal() {
   }
 }
 
+async function downloadTraceWithAuth(traceUrl) {
+  const res = await fetch(traceUrl, { headers: runFetchHeaders(false) });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Trace download failed');
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = objectUrl;
+  link.download = 'trace.zip';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+}
+
+function traceDownloadLinkHtml(traceUrl, text = 'Download trace') {
+  const safeUrl = escapeAttr(traceUrl || '');
+  return `<a href="${safeUrl}" data-trace-url="${safeUrl}">${escapeHtml(text)}</a>`;
+}
+
+document.addEventListener('click', (e) => {
+  const target = e.target;
+  const linkEl = target && target.closest ? target.closest('a[data-trace-url]') : null;
+  if (!linkEl) return;
+  e.preventDefault();
+  const traceUrl = linkEl.getAttribute('data-trace-url') || linkEl.getAttribute('href');
+  if (!traceUrl) return;
+  const prevText = linkEl.textContent || 'Download trace';
+  linkEl.textContent = 'Downloading...';
+  linkEl.setAttribute('aria-disabled', 'true');
+  void downloadTraceWithAuth(traceUrl)
+    .then(() => {
+      linkEl.textContent = 'Downloaded';
+      setTimeout(() => {
+        linkEl.textContent = prevText;
+      }, 1500);
+    })
+    .catch((err) => {
+      alert(err && err.message ? err.message : 'Trace download failed');
+      linkEl.textContent = prevText;
+    })
+    .finally(() => {
+      linkEl.removeAttribute('aria-disabled');
+    });
+});
+
 async function loadAccountView() {
   const emailEl = $('account-email');
   const lineEl = $('account-usage-line');
@@ -200,6 +267,13 @@ async function loadAccountView() {
   if (!isLoggedIn()) {
     if (lineEl) lineEl.textContent = 'Sign in to see usage.';
     if (resetEl) resetEl.textContent = '';
+    const sl = $('account-share-links-list');
+    const se = $('account-share-empty');
+    if (sl) sl.innerHTML = '';
+    if (se) {
+      se.hidden = false;
+      se.textContent = 'Sign in to see your share links.';
+    }
     return;
   }
   if (lineEl) lineEl.textContent = 'Loading…';
@@ -217,6 +291,382 @@ async function loadAccountView() {
   } catch {
     if (lineEl) lineEl.textContent = 'Could not load usage.';
     if (resetEl) resetEl.textContent = '';
+  }
+  const shareList = $('account-share-links-list');
+  const shareEmpty = $('account-share-empty');
+  if (shareList) shareList.innerHTML = 'Loading…';
+  try {
+    const recent = await api('GET', '/share-links/recent');
+    if (shareEmpty) {
+      shareEmpty.hidden = recent.length > 0;
+      if (!recent.length) {
+        shareEmpty.textContent =
+          'No active share links yet. Open a site and use Share to create one.';
+      }
+    }
+    if (shareList) {
+      if (!recent.length) {
+        shareList.innerHTML = '';
+      } else {
+        shareList.innerHTML = recent
+          .map(
+            l => `
+          <li class="account-share-row">
+            <span class="account-share-site">${escapeHtml(l.siteUrl)}</span>
+            <button type="button" class="btn-secondary btn-sm account-share-copy" data-url="${escapeHtml(
+              window.location.origin + l.sharePath
+            )}">Copy link</button>
+          </li>`
+          )
+          .join('');
+        shareList.querySelectorAll('.account-share-copy').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const u = btn.getAttribute('data-url');
+            if (u) {
+              navigator.clipboard.writeText(u).catch(() => {});
+              btn.textContent = 'Copied';
+              setTimeout(() => {
+                btn.textContent = 'Copy link';
+              }, 1500);
+            }
+          });
+        });
+      }
+    }
+  } catch {
+    if (shareList) shareList.innerHTML = '';
+    if (shareEmpty) shareEmpty.hidden = false;
+  }
+}
+
+function closeShareModal() {
+  const ov = $('share-overlay');
+  if (ov) {
+    ov.classList.add('hidden');
+    ov.setAttribute('aria-hidden', 'true');
+  }
+}
+
+async function loadShareLinksModal() {
+  const listEl = $('share-links-list');
+  const hint = $('share-modal-hint');
+  if (!selectedSiteUrl || !listEl) return;
+  listEl.innerHTML = '<li class="hint">Loading…</li>';
+  try {
+    const links = await api('GET', '/sites/' + encodeURIComponent(selectedSiteUrl) + '/share-links');
+    const base = window.location.origin;
+    if (!links.length) {
+      listEl.innerHTML = '<li class="hint">No links yet. Create one below.</li>';
+    } else {
+      listEl.innerHTML = links
+        .map(l => {
+          const full = l.sharePath ? base + l.sharePath : '';
+          const active = l.active;
+          return `<li class="share-link-row" data-id="${escapeHtml(l.id)}">
+            <code class="share-link-token">${active ? escapeHtml(full) : '(revoked)'}</code>
+            <div class="share-link-actions">
+              ${
+                active
+                  ? `<button type="button" class="btn-secondary btn-sm share-copy-btn" data-url="${escapeHtml(
+                      full
+                    )}">Copy</button>
+                 <button type="button" class="btn-secondary btn-sm share-revoke-btn">Revoke</button>`
+                  : '<span class="muted">Revoked</span>'
+              }
+            </div>
+          </li>`;
+        })
+        .join('');
+      listEl.querySelectorAll('.share-copy-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const u = btn.getAttribute('data-url');
+          if (u) navigator.clipboard.writeText(u).catch(() => {});
+        });
+      });
+      listEl.querySelectorAll('.share-revoke-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+          const row = btn.closest('.share-link-row');
+          const id = row && row.getAttribute('data-id');
+          if (!id) return;
+          try {
+            await api('DELETE', '/sites/' + encodeURIComponent(selectedSiteUrl) + '/share-links/' + id);
+            await loadShareLinksModal();
+            if (hint) hint.textContent = 'Link revoked.';
+          } catch (e) {
+            if (hint) hint.textContent = e.message || 'Revoke failed';
+          }
+        });
+      });
+    }
+  } catch (e) {
+    listEl.innerHTML = '';
+    if (hint) hint.textContent = e.message || 'Could not load links';
+  }
+}
+
+function openShareModal() {
+  if (!selectedSiteUrl) return;
+  if (!isLoggedIn()) {
+    switchAuthTab('signin');
+    openAuthModal();
+    return;
+  }
+  const ov = $('share-overlay');
+  if (ov) {
+    ov.classList.remove('hidden');
+    ov.setAttribute('aria-hidden', 'false');
+  }
+  const hint = $('share-modal-hint');
+  if (hint) hint.textContent = '';
+  void loadShareLinksModal();
+}
+
+function bindShareUi() {
+  $('btn-site-share')?.addEventListener('click', () => openShareModal());
+  $('share-modal-close')?.addEventListener('click', closeShareModal);
+  $('share-overlay')?.addEventListener('click', e => {
+    if (e.target.id === 'share-overlay') closeShareModal();
+  });
+  $('btn-share-create')?.addEventListener('click', async () => {
+    const hint = $('share-modal-hint');
+    if (!selectedSiteUrl) return;
+    try {
+      const created = await api('POST', '/sites/' + encodeURIComponent(selectedSiteUrl) + '/share-links', {});
+      const url = window.location.origin + created.sharePath;
+      await navigator.clipboard.writeText(url).catch(() => {});
+      if (hint) hint.textContent = 'New link created and copied: ' + url;
+      await loadShareLinksModal();
+    } catch (e) {
+      if (hint) hint.textContent = e.message || 'Could not create link';
+    }
+  });
+}
+
+function bindSharedVisitorUi() {
+  $('btn-shared-signin')?.addEventListener('click', () => {
+    switchAuthTab('signin');
+    openAuthModal();
+  });
+  $('btn-shared-back')?.addEventListener('click', () => {
+    renderSharedSiteList();
+    showView('sharedSite');
+  });
+  $('shared-btn-run')?.addEventListener('click', () => void runSharedScenario());
+}
+
+function renderSharedSiteList() {
+  const listEl = $('shared-site-scenario-list');
+  if (!listEl) return;
+  if (!sharedSiteScenarios.length) {
+    listEl.innerHTML = '<li class="empty-state">No scenarios on this shared site.</li>';
+    return;
+  }
+  listEl.innerHTML = sharedSiteScenarios
+    .map(
+      s => `
+    <li class="site-scenario-row">
+      <span class="scenario-item ${s.lastStatus || 'never'}" data-shared-scenario-id="${escapeHtml(s.id)}">
+        <span class="s-dot"></span>
+        <span class="s-name">${escapeHtml(s.name)}</span>
+      </span>
+    </li>`
+    )
+    .join('');
+  listEl.querySelectorAll('[data-shared-scenario-id]').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.getAttribute('data-shared-scenario-id');
+      if (id) openSharedScenarioDetail(id);
+    });
+  });
+}
+
+function openSharedScenarioDetail(id) {
+  const s = sharedSiteScenarios.find(x => x.id === id);
+  if (!s) return;
+  activeSharedScenario = s;
+  const nameEl = $('shared-detail-name');
+  const urlEl = $('shared-detail-url');
+  if (nameEl) nameEl.textContent = s.name;
+  if (urlEl) urlEl.textContent = s.siteUrl;
+  const stepsEl = $('shared-detail-steps');
+  if (stepsEl) {
+    stepsEl.innerHTML = (s.steps || [])
+      .map(
+        (step, i) => `
+      <li class="step-row">
+        <span class="step-num">${i + 1}</span>
+        <span class="step-type ${step.type}">${step.type}</span>
+        <span>${escapeHtml(step.instruction)}</span>
+      </li>`
+      )
+      .join('');
+  }
+  const out = $('shared-run-output');
+  if (out) out.innerHTML = '<p class="run-idle">Sign in to run, then click Run now.</p>';
+  const badge = $('shared-run-status-badge');
+  if (badge) badge.innerHTML = '';
+  showView('sharedScenario');
+}
+
+function handleSharedRunEvent(event, scenario, currentRunId) {
+  if (event.type === 'step') {
+    const el = $(`shared-run-step-${event.index}`);
+    if (!el) return;
+    el.className = `run-step ${event.status}`;
+    const icon = el.querySelector('.run-step-icon');
+    if (icon) icon.className = `run-step-icon ${event.status}`;
+    if (event.durationMs !== undefined) {
+      const dur = el.querySelector('.run-step-dur');
+      if (dur) dur.textContent = event.durationMs + 'ms';
+    }
+    if (event.error) {
+      const errDiv = document.createElement('div');
+      errDiv.className = 'run-error-box';
+      errDiv.textContent = event.error;
+      el.after(errDiv);
+    }
+    const nextEl = $(`shared-run-step-${event.index + 1}`);
+    if (nextEl && event.status === 'pass') {
+      nextEl.className = 'run-step running';
+      const ni = nextEl.querySelector('.run-step-icon');
+      if (ni) ni.className = 'run-step-icon running';
+    }
+  }
+  if (event.type === 'done') {
+    if (isLoggedIn()) {
+      void refreshMonthlyUsage();
+    }
+    const badge = $('shared-run-status-badge');
+    if (badge) badge.innerHTML = `<span class="badge ${event.status}">${event.status}</span>`;
+    const rb = $('shared-btn-run');
+    if (rb) {
+      rb.disabled = false;
+      rb.textContent = '▶ Run again';
+    }
+    if (event.traceUrl && $('shared-run-output')) {
+      const traceLink = document.createElement('p');
+      traceLink.className = 'run-trace-link';
+      traceLink.innerHTML = `Debug: ${traceDownloadLinkHtml(event.traceUrl)}`;
+      $('shared-run-output').appendChild(traceLink);
+    }
+  }
+}
+
+async function runSharedScenario() {
+  if (!activeSharedScenario || !shareTokenActive) return;
+  if (!isLoggedIn()) {
+    openAuthModal();
+    switchAuthTab('signin');
+    return;
+  }
+  const scenario = activeSharedScenario;
+  const btn = $('shared-btn-run');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Running…';
+  }
+  const badge = $('shared-run-status-badge');
+  if (badge) badge.innerHTML = '<span class="badge running">running</span>';
+  const output = $('shared-run-output');
+  if (output) {
+    output.innerHTML = scenario.steps
+      .map(
+        (step, i) => `
+      <div class="run-step pending" id="shared-run-step-${i}">
+        <span class="run-step-icon pending"></span>
+        <span class="run-step-text">${escapeHtml(step.instruction)}</span>
+        <span class="run-step-dur"></span>
+      </div>`
+      )
+      .join('');
+  }
+  const headlessEl = $('shared-run-headless');
+  const headless = headlessEl ? headlessEl.checked : true;
+  const res = await fetch(
+    '/api/share/' + encodeURIComponent(shareTokenActive) + '/scenarios/' + encodeURIComponent(scenario.id) + '/run',
+    {
+      method: 'POST',
+      headers: runFetchHeaders(true),
+      body: JSON.stringify({ headless }),
+    }
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    if (res.status === 402 && err.error === 'monthly_limit_exceeded') {
+      monthlyUsageCache = {
+        monthlyRunsUsed: err.used,
+        monthlyRunsLimit: err.limit,
+        monthlyRunsRemaining: err.remaining ?? 0,
+        atLimit: true,
+      };
+      openPaywallModal(err);
+    } else {
+      alert(err.error || res.statusText || 'Run failed');
+    }
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '▶ Run now';
+    }
+    if (badge) badge.innerHTML = '';
+    if (output) output.innerHTML = '<p class="run-idle">Try again after signing in or fixing the error.</p>';
+    return;
+  }
+  if (!res.body) {
+    alert('No response body');
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '▶ Run now';
+    }
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let currentRunId = null;
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      let event;
+      try {
+        event = JSON.parse(line.slice(6));
+      } catch {
+        continue;
+      }
+      if (event.type === 'start' && event.run) currentRunId = event.run.id;
+      handleSharedRunEvent(event, scenario, currentRunId);
+    }
+  }
+}
+
+async function bootstrapSharedVisitor(token) {
+  shareTokenActive = token;
+  const titleEl = $('shared-site-title');
+  const urlEl = $('shared-site-url');
+  const listEl = $('shared-site-scenario-list');
+  try {
+    const r = await fetch('/api/share/' + encodeURIComponent(token) + '/site');
+    if (!r.ok) {
+      if (titleEl) titleEl.textContent = 'Link unavailable';
+      if (urlEl) urlEl.textContent = 'This share link is invalid or has been revoked.';
+      if (listEl) listEl.innerHTML = '';
+      showView('sharedSite');
+      return;
+    }
+    const data = await r.json();
+    sharedSiteScenarios = data.scenarios || [];
+    if (urlEl) urlEl.textContent = data.siteUrl || '';
+    if (titleEl) titleEl.textContent = 'Shared scenarios';
+    renderSharedSiteList();
+    showView('sharedSite');
+  } catch {
+    if (titleEl) titleEl.textContent = 'Error';
+    if (urlEl) urlEl.textContent = 'Could not load shared site.';
+    showView('sharedSite');
   }
 }
 
@@ -793,9 +1243,7 @@ async function runAllScenariosForSite() {
             const tr = row.querySelector('.site-dash-trace');
             if (tr && ev.traceUrl) {
               tr.innerHTML =
-                '<a href="' +
-                escapeHtml(ev.traceUrl) +
-                '" download="trace.zip">Download trace</a>';
+                traceDownloadLinkHtml(ev.traceUrl);
             }
           }
         }
@@ -1284,6 +1732,9 @@ async function openScenario(id) {
         <button type="button" class="btn-secondary btn-sm step-edit-toggle" data-step-index="${i}">
           Edit step
         </button>
+        <button type="button" class="btn-secondary btn-sm step-add-toggle" data-add-after-index="${i}">
+          Add after (AI)
+        </button>
       </div>
       <div class="step-edit-inline hidden" id="step-edit-inline-${i}">
         <label class="edit-scenario-label" for="step-edit-input-${i}">Edit step ${i + 1}</label>
@@ -1295,14 +1746,51 @@ async function openScenario(id) {
           </button>
         </div>
       </div>
+      <div class="step-add-inline hidden" id="step-add-inline-${i}">
+        <label class="edit-scenario-label" for="step-add-input-${i}">Add one step after step ${i + 1}</label>
+        <p class="edit-scenario-hint">Describe exactly what the new step should do.</p>
+        <div class="edit-scenario-row">
+          <textarea id="step-add-input-${i}" class="edit-scenario-input" rows="2" placeholder="e.g. Click “La RSE en PME : une démarche créatrice de valeur”"></textarea>
+          <button type="button" class="btn-primary edit-scenario-apply step-add-apply" data-add-after-index="${i}">
+            Add step
+          </button>
+        </div>
+      </div>
     </li>
-  `).join('');
+  `).join('') + `
+    <li class="step-row step-row-add-end">
+      <div class="step-row-main">
+        <span class="step-num">+</span>
+        <span class="step-text">Add a new step at the end</span>
+        <button type="button" class="btn-secondary btn-sm step-add-toggle" data-add-after-index="end">
+          Add at end (AI)
+        </button>
+      </div>
+      <div class="step-add-inline hidden" id="step-add-inline-end">
+        <label class="edit-scenario-label" for="step-add-input-end">Add one step at the end</label>
+        <p class="edit-scenario-hint">Describe exactly what the new step should do.</p>
+        <div class="edit-scenario-row">
+          <textarea id="step-add-input-end" class="edit-scenario-input" rows="2" placeholder="e.g. Verify at least one session card is visible"></textarea>
+          <button type="button" class="btn-primary edit-scenario-apply step-add-apply" data-add-after-index="end">
+            Add step
+          </button>
+        </div>
+      </div>
+    </li>
+  `;
   activeStepEditIndex = null;
+  activeAddStepIndex = null;
   $('detail-steps').querySelectorAll('.step-edit-toggle').forEach(btn => {
     btn.onclick = () => toggleStepEditor(Number(btn.dataset.stepIndex));
   });
   $('detail-steps').querySelectorAll('.step-edit-apply').forEach(btn => {
     btn.onclick = () => applyStepEdit(Number(btn.dataset.stepIndex));
+  });
+  $('detail-steps').querySelectorAll('.step-add-toggle').forEach(btn => {
+    btn.onclick = () => toggleAddStepEditor(btn.dataset.addAfterIndex);
+  });
+  $('detail-steps').querySelectorAll('.step-add-apply').forEach(btn => {
+    btn.onclick = () => applyAddStep(btn.dataset.addAfterIndex);
   });
 
   setScenarioHint('', false);
@@ -1310,7 +1798,15 @@ async function openScenario(id) {
   if (editInput) editInput.value = '';
   const editPanel = $('edit-scenario-panel');
   if (editPanel) editPanel.classList.add('hidden');
-  resetRunOutput();
+  let restoredRunUi = false;
+  if (runInProgressScenarioId === s.id) {
+    // Keep current output while the run is streaming.
+    restoredRunUi = true;
+  } else if (restoreRunUiForScenario(s.id)) {
+    restoredRunUi = true;
+  } else {
+    resetRunOutput();
+  }
   const forSite = authProfilesForSite(s.siteUrl);
   const activeProfile = s.authProfileId ? forSite.find((p) => p.id === s.authProfileId) : null;
   const statusEl = $('scenario-auth-status');
@@ -1358,7 +1854,7 @@ async function openScenario(id) {
     };
   }
   const runBtn = $('btn-run');
-  if (runBtn) {
+  if (runBtn && !restoredRunUi) {
     const st = runButtonStateForRunBtn();
     runBtn.disabled = st.disabled;
     runBtn.title = st.title;
@@ -1403,6 +1899,36 @@ function toggleStepEditor(index) {
   }
 }
 
+function stepAddInlineId(addAfterIndexRaw) {
+  return addAfterIndexRaw === 'end' ? 'step-add-inline-end' : `step-add-inline-${addAfterIndexRaw}`;
+}
+
+function stepAddInputId(addAfterIndexRaw) {
+  return addAfterIndexRaw === 'end' ? 'step-add-input-end' : `step-add-input-${addAfterIndexRaw}`;
+}
+
+function normalizeAddAfterIndex(addAfterIndexRaw) {
+  if (addAfterIndexRaw === 'end') return 'end';
+  const idx = Number(addAfterIndexRaw);
+  return Number.isInteger(idx) && idx >= 0 ? idx : null;
+}
+
+function toggleAddStepEditor(addAfterIndexRaw) {
+  const id = stepAddInlineId(addAfterIndexRaw);
+  const current = $(id);
+  if (!current) return;
+  const shouldOpen = current.classList.contains('hidden');
+  document.querySelectorAll('.step-add-inline').forEach(el => el.classList.add('hidden'));
+  if (shouldOpen) {
+    current.classList.remove('hidden');
+    const input = $(stepAddInputId(addAfterIndexRaw));
+    if (input) input.focus();
+    activeAddStepIndex = normalizeAddAfterIndex(addAfterIndexRaw);
+  } else {
+    activeAddStepIndex = null;
+  }
+}
+
 async function applyStepEdit(stepIndex) {
   if (!activeScenarioId) return;
   const input = $(`step-edit-input-${stepIndex}`);
@@ -1426,9 +1952,65 @@ async function applyStepEdit(stepIndex) {
   }
 }
 
+async function addStepWithAI(addAfterIndex, userMessage) {
+  if (!activeScenarioId) return null;
+  const scenario = scenarios.find(s => s.id === activeScenarioId);
+  if (!scenario) return null;
+  const locationText = addAfterIndex === 'end'
+    ? 'at the end'
+    : `after step ${Number(addAfterIndex) + 1}`;
+  const constrainedPrompt = [
+    `Insert exactly one new step ${locationText}.`,
+    'Keep all existing steps in the same order and unchanged.',
+    'Do not rename the scenario and do not change the description.',
+    `New step request: ${userMessage}`,
+  ].join(' ');
+  return await api('POST', `/scenarios/${activeScenarioId}/modify-before-run`, { userMessage: constrainedPrompt });
+}
+
+async function applyAddStep(addAfterIndexRaw) {
+  if (!activeScenarioId) return;
+  const addAfterIndex = normalizeAddAfterIndex(addAfterIndexRaw);
+  if (addAfterIndex === null) {
+    setScenarioHint('Invalid insert location.', true);
+    return;
+  }
+  const input = $(stepAddInputId(addAfterIndexRaw));
+  const userMessage = input ? input.value.trim() : '';
+  if (!userMessage) {
+    setScenarioHint('Describe the step you want to add.', true);
+    return;
+  }
+  showOverlay('Adding step with AI…');
+  try {
+    const updated = await addStepWithAI(addAfterIndex, userMessage);
+    const idx = scenarios.findIndex(s => s.id === activeScenarioId);
+    if (idx >= 0) scenarios[idx] = updated;
+    if (input) input.value = '';
+    openScenario(activeScenarioId);
+    const loc = addAfterIndex === 'end' ? 'at the end' : `after step ${addAfterIndex + 1}`;
+    setScenarioHint(`Step added ${loc}.`, false);
+  } catch (err) {
+    setScenarioHint('Error: ' + err.message, true);
+  } finally {
+    hideOverlay();
+  }
+}
+
 function resetRunOutput() {
-  $('run-output').innerHTML = '<p class="run-idle">Hit "Run now" to execute this scenario.</p>';
-  $('run-status-badge').innerHTML = '';
+  // Revoke snapshot object URLs when clearing the trace details panel.
+  // (Otherwise blob: URLs can leak when switching scenarios.)
+  const container = $('run-output');
+  const panel = container && container.querySelector('.trace-details-panel');
+  if (panel) {
+    panel.querySelectorAll('[data-snapshot-object-url]').forEach((el) => {
+      const objectUrl = el.getAttribute('data-snapshot-object-url');
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    });
+  }
+  container.innerHTML = '<p class="run-idle">Hit "Run now" to execute this scenario.</p>';
+  const badge = $('run-status-badge');
+  if (badge) badge.innerHTML = '';
   const rb = $('btn-run');
   if (rb) {
     const st = runButtonStateForRunBtn();
@@ -1438,10 +2020,50 @@ function resetRunOutput() {
   }
 }
 
+function cacheRunUiForScenario(scenarioId) {
+  if (!scenarioId) return;
+  const out = $('run-output');
+  const badge = $('run-status-badge');
+  const rb = $('btn-run');
+  if (!out) return;
+  runUiCacheByScenarioId.set(scenarioId, {
+    runOutputHtml: out.innerHTML,
+    runStatusBadgeHtml: badge ? badge.innerHTML : '',
+    runButtonState: rb
+      ? { disabled: rb.disabled, title: rb.title || '', textContent: rb.textContent || '' }
+      : null,
+  });
+}
+
+function restoreRunUiForScenario(scenarioId) {
+  if (!scenarioId) return false;
+  const cached = runUiCacheByScenarioId.get(scenarioId);
+  if (!cached) return false;
+
+  const out = $('run-output');
+  const badge = $('run-status-badge');
+  const rb = $('btn-run');
+
+  if (out) out.innerHTML = cached.runOutputHtml || '';
+  if (badge) badge.innerHTML = cached.runStatusBadgeHtml || '';
+  if (rb && cached.runButtonState) {
+    rb.disabled = !!cached.runButtonState.disabled;
+    rb.title = cached.runButtonState.title || '';
+    rb.textContent = cached.runButtonState.textContent || '';
+  }
+  return true;
+}
+
 async function loadAndRenderTraceDetails(runId) {
   const container = $('run-output');
   let panel = container.querySelector('.trace-details-panel');
-  if (panel) panel.remove();
+  if (panel) {
+    panel.querySelectorAll('[data-snapshot-object-url]').forEach((el) => {
+      const objectUrl = el.getAttribute('data-snapshot-object-url');
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    });
+    panel.remove();
+  }
   try {
     const details = await api('GET', '/runs/' + runId + '/details');
     panel = document.createElement('div');
@@ -1458,10 +2080,16 @@ async function loadAndRenderTraceDetails(runId) {
       const raw = JSON.stringify({ instruction: s.instruction, type: s.type, status: s.status, durationMs: s.durationMs, error: s.error }, null, 2);
       const snapshotBlock = s.snapshotUrl
         ? `<div class="trace-step-snapshot-wrap">
-            <a href="${s.snapshotUrl}" target="_blank" rel="noopener noreferrer" class="trace-step-snapshot-link">
-              <img class="trace-step-snapshot" src="${s.snapshotUrl}" alt="Step ${s.stepIndex + 1} snapshot" loading="lazy" />
+            <a class="trace-step-snapshot-link" data-snapshot-link>
+              <img
+                class="trace-step-snapshot"
+                data-snapshot-image
+                data-snapshot-url="${escapeAttr(s.snapshotUrl)}"
+                alt="Step ${s.stepIndex + 1} snapshot"
+                loading="lazy"
+              />
             </a>
-            <p class="trace-step-snapshot-hint">Click image to open full snapshot</p>
+            <p class="trace-step-snapshot-hint" data-snapshot-hint>Loading snapshot…</p>
           </div>`
         : '<p class="trace-step-no-snapshot">No snapshot for this step.</p>';
       const isOpen = s.status === 'fail' ? ' open' : '';
@@ -1487,6 +2115,37 @@ async function loadAndRenderTraceDetails(runId) {
     });
     panel.appendChild(timeline);
     container.appendChild(panel);
+    const snapshotImages = panel.querySelectorAll('[data-snapshot-image]');
+    await Promise.all(
+      Array.from(snapshotImages).map(async (imgEl) => {
+        const snapshotUrl = imgEl.getAttribute('data-snapshot-url');
+        if (!snapshotUrl) return;
+        const wrap = imgEl.closest('.trace-step-snapshot-wrap');
+        const linkEl = wrap && wrap.querySelector('[data-snapshot-link]');
+        const hintEl = wrap && wrap.querySelector('[data-snapshot-hint]');
+        try {
+          const res = await fetch(snapshotUrl, { headers: runFetchHeaders(false) });
+          if (!res.ok) throw new Error('snapshot_fetch_failed');
+          const blob = await res.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          imgEl.src = objectUrl;
+          if (wrap) wrap.setAttribute('data-snapshot-object-url', objectUrl);
+          if (linkEl) {
+            linkEl.href = objectUrl;
+            linkEl.target = '_blank';
+            linkEl.rel = 'noopener noreferrer';
+          }
+          if (hintEl) hintEl.textContent = 'Click image to open full snapshot';
+        } catch (_) {
+          if (hintEl) hintEl.textContent = 'Snapshot unavailable.';
+          if (linkEl) {
+            linkEl.removeAttribute('href');
+            linkEl.removeAttribute('target');
+            linkEl.removeAttribute('rel');
+          }
+        }
+      })
+    );
   } catch (_) {
     // If details fail (e.g. run not found), skip trace panel
   }
@@ -1507,6 +2166,7 @@ async function runActiveScenario() {
     return;
   }
 
+  runInProgressScenarioId = scenario.id;
   $('btn-run').disabled = true;
   $('btn-run').textContent = 'Running…';
   $('run-status-badge').innerHTML = '<span class="badge running">running</span>';
@@ -1520,6 +2180,7 @@ async function runActiveScenario() {
       <span class="run-step-dur"></span>
     </div>
   `).join('');
+  cacheRunUiForScenario(scenario.id);
 
   const headless = $('run-headless').checked;
   const authProfileId = scenario.authProfileId || undefined;
@@ -1541,11 +2202,13 @@ async function runActiveScenario() {
     } else {
       alert(err.error || res.statusText || 'Run failed');
     }
+    runInProgressScenarioId = null;
     resetRunOutput();
     return;
   }
   if (!res.body) {
     alert('No response body');
+    runInProgressScenarioId = null;
     resetRunOutput();
     return;
   }
@@ -1584,6 +2247,29 @@ function handleRunEvent(event, scenario, currentRunId) {
       errDiv.className = 'run-error-box';
       errDiv.textContent = event.error;
       el.after(errDiv);
+      const actions = document.createElement('div');
+      actions.className = 'run-step-ai-actions';
+      actions.innerHTML = `
+        <button type="button" class="btn-secondary btn-sm" data-run-action="fix" data-step-index="${event.index}">
+          Fix this step (AI)
+        </button>
+        <button type="button" class="btn-secondary btn-sm" data-run-action="remove" data-step-index="${event.index}">
+          Remove this step (AI)
+        </button>
+      `;
+      errDiv.after(actions);
+      const fixBtn = actions.querySelector('[data-run-action="fix"]');
+      const removeBtn = actions.querySelector('[data-run-action="remove"]');
+      if (fixBtn) {
+        fixBtn.onclick = () => {
+          void fixFailedStepWithAI(event.index, event.error);
+        };
+      }
+      if (removeBtn) {
+        removeBtn.onclick = () => {
+          void removeStepWithAI(event.index);
+        };
+      }
     }
     // Mark next step as running
     const nextEl = $(`run-step-${event.index + 1}`);
@@ -1594,6 +2280,8 @@ function handleRunEvent(event, scenario, currentRunId) {
   }
 
   if (event.type === 'done') {
+    const scenarioId = scenario.id;
+    runInProgressScenarioId = null;
     if (!isLoggedIn()) {
       const n = trialRunsUsed() + 1;
       sessionStorage.setItem(TRIAL_RUNS_KEY, String(n));
@@ -1607,6 +2295,7 @@ function handleRunEvent(event, scenario, currentRunId) {
           rb2.title = st.title;
           rb2.textContent = '▶ Run again';
         }
+        cacheRunUiForScenario(scenarioId);
         if (views.account && views.account.classList.contains('active')) void loadAccountView();
       });
     }
@@ -1625,15 +2314,53 @@ function handleRunEvent(event, scenario, currentRunId) {
     if (event.traceUrl) {
       const traceLink = document.createElement('p');
       traceLink.className = 'run-trace-link';
-      traceLink.innerHTML = `Debug: <a href="${event.traceUrl}" download="trace.zip">Download trace</a> (open with <code>npx playwright show-trace trace.zip</code>)`;
+      traceLink.innerHTML = `Debug: ${traceDownloadLinkHtml(event.traceUrl)} (open with <code>npx playwright show-trace trace.zip</code>)`;
       $('run-output').appendChild(traceLink);
     }
 
+    cacheRunUiForScenario(scenarioId);
+
     // Load and show in-app trace details timeline
-    if (currentRunId) loadAndRenderTraceDetails(currentRunId);
+    if (currentRunId) {
+      void loadAndRenderTraceDetails(currentRunId).then(() => cacheRunUiForScenario(scenarioId));
+    }
 
     // Refresh scenario status in sidebar
     loadScenarios().then(() => renderSidebarList());
+  }
+}
+
+async function fixFailedStepWithAI(stepIndex, errorText) {
+  if (!activeScenarioId) return;
+  showOverlay('Fixing failed step with AI…');
+  try {
+    const userMessage = `Fix this failed step based on the error: "${errorText}". Keep the same intent but make it robust and executable.`;
+    const updated = await api('POST', `/scenarios/${activeScenarioId}/modify-step`, { stepIndex, userMessage });
+    const idx = scenarios.findIndex(s => s.id === activeScenarioId);
+    if (idx >= 0) scenarios[idx] = updated;
+    openScenario(activeScenarioId);
+    setScenarioHint(`Step ${stepIndex + 1} updated from failure context.`, false);
+  } catch (err) {
+    setScenarioHint('Error: ' + err.message, true);
+  } finally {
+    hideOverlay();
+  }
+}
+
+async function removeStepWithAI(stepIndex) {
+  if (!activeScenarioId) return;
+  showOverlay('Removing step with AI…');
+  try {
+    const userMessage = `Remove step ${stepIndex + 1} only. Keep all other steps unchanged, in the same order. Do not rename the scenario or change the description.`;
+    const updated = await api('POST', `/scenarios/${activeScenarioId}/modify-before-run`, { userMessage });
+    const idx = scenarios.findIndex(s => s.id === activeScenarioId);
+    if (idx >= 0) scenarios[idx] = updated;
+    openScenario(activeScenarioId);
+    setScenarioHint(`Step ${stepIndex + 1} removed.`, false);
+  } catch (err) {
+    setScenarioHint('Error: ' + err.message, true);
+  } finally {
+    hideOverlay();
   }
 }
 
@@ -1874,19 +2601,41 @@ const RUN_HEADLESS_KEY = 'viberegress_run_headless';
 
 (function initRunHeadlessPreference() {
   try {
-    const el = $('run-headless');
-    if (!el) return;
     const stored = localStorage.getItem(RUN_HEADLESS_KEY);
-    if (stored !== null) el.checked = stored === 'true';
-    el.addEventListener('change', () => {
-      localStorage.setItem(RUN_HEADLESS_KEY, $('run-headless').checked);
-    });
+    const el = $('run-headless');
+    if (el) {
+      if (stored !== null) el.checked = stored === 'true';
+      el.addEventListener('change', () => {
+        localStorage.setItem(RUN_HEADLESS_KEY, $('run-headless').checked);
+        const sh = $('shared-run-headless');
+        if (sh) sh.checked = $('run-headless').checked;
+      });
+    }
+    const sh = $('shared-run-headless');
+    if (sh) {
+      if (stored !== null) sh.checked = stored === 'true';
+      sh.addEventListener('change', () => {
+        localStorage.setItem(RUN_HEADLESS_KEY, sh.checked);
+        const rh = $('run-headless');
+        if (rh) rh.checked = sh.checked;
+      });
+    }
   } catch (_) {}
 })();
 
 (async () => {
   bindAuthUi();
   bindAccountUi();
+  bindShareUi();
+  const pathToken = parseSharePath();
+  if (pathToken) {
+    const appEl = document.getElementById('app');
+    if (appEl) appEl.classList.add('shared-visitor');
+    await initAuth();
+    bindSharedVisitorUi();
+    await bootstrapSharedVisitor(pathToken);
+    return;
+  }
   await initAuth();
   if (isLoggedIn()) await refreshMonthlyUsage();
   try {

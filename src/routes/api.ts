@@ -11,7 +11,9 @@ import {
   getRunRepository,
   getScenarioVersionRepository,
   getAuthProfileRepository,
+  getSiteShareLinkRepository,
 } from '../repositories/index.js';
+import { scenarioToPublicJson, isValidShareTokenFormat } from '../lib/site-share.js';
 import { discoverScenarios, runScenario } from '../services/stagehand.js';
 import { validateAndNormalizeSteps } from '../services/step-quality.js';
 import { modifyScenarioWithAI, createScenarioFromPrompt, modifyScenarioStepWithAI } from '../services/scenario-modifier.js';
@@ -71,6 +73,24 @@ router.get('/config', (_req: Request, res: Response) => {
   });
 });
 
+/** Public: read-only scenarios for a valid share token (no auth). */
+router.get('/share/:token/site', async (req: Request, res: Response) => {
+  const raw = req.params.token || '';
+  if (!isValidShareTokenFormat(raw)) {
+    return res.status(404).json({ error: 'invalid_or_expired_share_link' });
+  }
+  const link = await getSiteShareLinkRepository().getActiveByToken(raw);
+  if (!link) {
+    return res.status(404).json({ error: 'invalid_or_expired_share_link' });
+  }
+  const scenarios = await getScenarioRepository().listByUserIdAndSiteNormalized(link.ownerUserId, link.siteUrl);
+  res.json({
+    siteUrl: link.siteUrl,
+    scenarios: scenarios.map(scenarioToPublicJson),
+    sharedView: true,
+  });
+});
+
 router.use((req: Request, res: Response, next) => {
   void authMiddleware(req, res, next);
 });
@@ -124,6 +144,82 @@ router.post('/auth/claim-session', async (req: Request, res: Response) => {
   const nS = await getScenarioRepository().claimAnonymousToUser(sessionId, userId);
   const nP = await getAuthProfileRepository().claimAnonymousToUser(sessionId, userId);
   res.json({ ok: true, scenariosClaimed: nS, authProfilesClaimed: nP });
+});
+
+router.post('/sites/:siteUrl/share-links', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(403).json({ error: 'Sign in required' });
+  }
+  let siteUrlDecoded: string;
+  try {
+    siteUrlDecoded = decodeURIComponent(req.params.siteUrl);
+  } catch {
+    return res.status(400).json({ error: 'Invalid site URL' });
+  }
+  const norm = normalizeSiteUrlForMatch(siteUrlDecoded);
+  const existing = await getScenarioRepository().listByUserIdAndSiteNormalized(req.owner!.id, norm);
+  if (!existing.length) {
+    return res.status(404).json({ error: 'No scenarios for this site' });
+  }
+  const link = await getSiteShareLinkRepository().create(req.owner!.id, norm);
+  res.status(201).json({
+    id: link.id,
+    token: link.token,
+    siteUrl: link.siteUrl,
+    createdAt: link.createdAt,
+    sharePath: `/share/${link.token}`,
+  });
+});
+
+router.get('/sites/:siteUrl/share-links', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(403).json({ error: 'Sign in required' });
+  }
+  let siteUrlDecoded: string;
+  try {
+    siteUrlDecoded = decodeURIComponent(req.params.siteUrl);
+  } catch {
+    return res.status(400).json({ error: 'Invalid site URL' });
+  }
+  const norm = normalizeSiteUrlForMatch(siteUrlDecoded);
+  const links = await getSiteShareLinkRepository().listByOwnerAndSite(req.owner!.id, norm);
+  res.json(
+    links.map((l) => ({
+      id: l.id,
+      token: l.token,
+      siteUrl: l.siteUrl,
+      createdAt: l.createdAt,
+      revokedAt: l.revokedAt,
+      expiresAt: l.expiresAt,
+      active: !l.revokedAt,
+      sharePath: l.revokedAt ? null : `/share/${l.token}`,
+    }))
+  );
+});
+
+router.delete('/sites/:siteUrl/share-links/:linkId', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(403).json({ error: 'Sign in required' });
+  }
+  const ok = await getSiteShareLinkRepository().revoke(req.owner!.id, req.params.linkId);
+  if (!ok) return res.status(404).json({ error: 'Not found' });
+  res.json({ ok: true });
+});
+
+router.get('/share-links/recent', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(403).json({ error: 'Sign in required' });
+  }
+  const links = await getSiteShareLinkRepository().listRecentByOwner(req.owner!.id, 15);
+  res.json(
+    links.map((l) => ({
+      id: l.id,
+      token: l.token,
+      siteUrl: l.siteUrl,
+      createdAt: l.createdAt,
+      sharePath: `/share/${l.token}`,
+    }))
+  );
 });
 
 router.get('/scenarios', async (req: Request, res: Response) => {
@@ -896,6 +992,110 @@ router.post('/scenarios/:id/run', async (req: Request, res: Response) => {
 
   send({ type: 'done', status: run.status, error: clientError, traceUrl: traceUrl ?? undefined });
   res.end();
+});
+
+/**
+ * Run a scenario from a shared site link. Caller must be signed in; run counts against caller's monthly quota.
+ * Auth cookies/profiles are resolved as the link owner (scenario author).
+ */
+router.post('/share/:token/scenarios/:id/run', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(401).json({ error: 'Sign in required to run shared scenarios' });
+  }
+  const raw = req.params.token || '';
+  if (!isValidShareTokenFormat(raw)) {
+    return res.status(404).json({ error: 'invalid_or_expired_share_link' });
+  }
+  const link = await getSiteShareLinkRepository().getActiveByToken(raw);
+  if (!link) {
+    return res.status(404).json({ error: 'invalid_or_expired_share_link' });
+  }
+  const scenarioOwner: Owner = { type: 'user', id: link.ownerUserId };
+  const scenario = await getScenarioRepository().getById(req.params.id, scenarioOwner);
+  if (!scenario) {
+    return res.status(404).json({ error: 'Not found' });
+  }
+  if (normalizeSiteUrlForMatch(scenario.siteUrl) !== normalizeSiteUrlForMatch(link.siteUrl)) {
+    return res.status(403).json({ error: 'scenario_not_in_shared_site' });
+  }
+
+  const usage = await getSignedInMonthlyUsage(req.owner!.id);
+  if (usage.atLimit) {
+    return res.status(402).json({
+      error: 'monthly_limit_exceeded',
+      used: usage.used,
+      limit: usage.limit,
+      remaining: usage.remaining,
+      periodStartUtc: usage.periodStartUtc,
+      periodEndExclusiveUtc: usage.periodEndExclusiveUtc,
+      checkoutUrl: '/billing',
+    });
+  }
+
+  const { headless, authProfileId: requestAuthProfileId } = req.body as {
+    headless?: boolean;
+    authProfileId?: string;
+  };
+  const headlessOpt = headless !== undefined ? headless : undefined;
+  const authProfileId = requestAuthProfileId ?? scenario.authProfileId ?? undefined;
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  const send = (data: object) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+  const ctx = { requestId: req.requestId, traceId: req.traceId };
+  const { run, clientError, traceUrl } = await executeScenarioRunPipeline(
+    scenario,
+    scenarioOwner,
+    { headless: headlessOpt, authProfileId },
+    p => send({ type: 'step', index: p.index, status: p.status, error: p.error, durationMs: p.durationMs }),
+    runReady => send({ type: 'start', run: runReady }),
+    ctx
+  );
+
+  const shareTraceUrl = traceUrl
+    ? `/api/share/${encodeURIComponent(raw)}/runs/${run.id}/trace`
+    : undefined;
+  send({ type: 'done', status: run.status, error: clientError, traceUrl: shareTraceUrl ?? undefined });
+  res.end();
+});
+
+router.get('/share/:token/runs/:runId/trace', async (req: Request, res: Response) => {
+  if (req.owner!.type !== 'user') {
+    return res.status(401).json({ error: 'Sign in required' });
+  }
+  const raw = req.params.token || '';
+  if (!isValidShareTokenFormat(raw)) {
+    return res.status(404).json({ error: 'Trace not found' });
+  }
+  const link = await getSiteShareLinkRepository().getActiveByToken(raw);
+  if (!link) {
+    return res.status(404).json({ error: 'Trace not found' });
+  }
+  const run = await getRunRepository().getById(req.params.runId);
+  if (!run) {
+    return res.status(404).json({ error: 'Trace not found' });
+  }
+  const scenario = await getScenarioRepository().getById(run.scenarioId, {
+    type: 'user',
+    id: link.ownerUserId,
+  });
+  if (
+    !scenario ||
+    normalizeSiteUrlForMatch(scenario.siteUrl) !== normalizeSiteUrlForMatch(link.siteUrl)
+  ) {
+    return res.status(404).json({ error: 'Trace not found' });
+  }
+  const traceDir = getArtifactDir(req.params.runId, null);
+  const traceFile = path.join(traceDir, 'trace.zip');
+  if (!fs.existsSync(traceFile)) {
+    return res.status(404).json({ error: 'Trace not found' });
+  }
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', 'attachment; filename="trace.zip"');
+  res.sendFile(path.resolve(traceFile));
 });
 
 async function runBelongsToOwner(runId: string, owner: Owner | undefined): Promise<boolean> {

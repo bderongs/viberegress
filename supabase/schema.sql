@@ -119,3 +119,18 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_events_discovery_id ON public.telemetry
 CREATE INDEX IF NOT EXISTS idx_telemetry_events_occurred_at ON public.telemetry_events(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_run_artifacts_run_id ON public.run_artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_scenario_versions_run_id ON public.scenario_versions(run_id);
+
+-- Magic links: public read-only access to a site workspace (scenarios)
+CREATE TABLE IF NOT EXISTS public.site_share_links (
+  id text PRIMARY KEY,
+  token text NOT NULL UNIQUE,
+  owner_user_id text NOT NULL,
+  site_url text NOT NULL,
+  created_at text NOT NULL,
+  revoked_at text,
+  expires_at text,
+  allow_public_read boolean NOT NULL DEFAULT true
+);
+
+CREATE INDEX IF NOT EXISTS idx_site_share_links_token ON public.site_share_links(token);
+CREATE INDEX IF NOT EXISTS idx_site_share_links_owner_site ON public.site_share_links(owner_user_id, site_url);

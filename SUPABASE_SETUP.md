@@ -19,3 +19,5 @@
 Restart the VibeRegress server after changing `.env`.
 
 **Usage:** Signed-in users get **20 scenario runs per calendar month (UTC)**. Usage is derived from `runs` joined to owned `scenarios`. `GET /api/usage` returns the current counts for the **My account** page.
+
+**Sharing:** If you already ran an older `schema.sql`, run the new `site_share_links` block from the file (or re-run the full script). Share links are `https://<host>/share/<token>` — public read-only; runs require sign-in and use the link owner’s auth profiles when configured.

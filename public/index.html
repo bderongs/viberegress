@@ -222,6 +222,7 @@
             <p class="view-sub" id="site-page-url"></p>
           </div>
           <div class="site-view-actions">
+            <button type="button" class="btn-secondary" id="btn-site-share" title="Share read-only link">Share</button>
             <button type="button" class="btn-secondary" id="btn-site-run-all" title="">Run all scenarios</button>
             <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
           </div>
@@ -297,6 +298,61 @@
           <p id="account-usage-reset" class="hint"></p>
           <button type="button" class="btn-primary" id="btn-account-upgrade">Upgrade (coming soon)</button>
         </section>
+        <section class="panel account-share-panel">
+          <p class="panel-label">Recent share links</p>
+          <p class="hint account-share-hint">Anyone with a link can view scenarios for that site. Running requires sign-in.</p>
+          <ul id="account-share-links-list" class="account-share-links-list"></ul>
+          <p class="hint" id="account-share-empty" hidden>No active share links yet. Open a site and use <strong>Share</strong>.</p>
+        </section>
+      </div>
+
+      <!-- Shared link visitor: site list -->
+      <div id="view-shared-site" class="view">
+        <p class="shared-readonly-banner" id="shared-site-banner">
+          Shared view — read-only. <strong>Sign in</strong> to run scenarios.
+        </p>
+        <div class="view-header">
+          <div>
+            <h2 id="shared-site-title">Scenarios</h2>
+            <p class="view-sub" id="shared-site-url"></p>
+          </div>
+          <button type="button" class="btn-secondary btn-sm" id="btn-shared-signin">Sign in to run</button>
+        </div>
+        <section class="site-section">
+          <p class="panel-label">Scenarios</p>
+          <ul id="shared-site-scenario-list" class="site-scenario-list"></ul>
+        </section>
+      </div>
+
+      <!-- Shared link visitor: scenario detail -->
+      <div id="view-shared-scenario" class="view">
+        <p class="shared-readonly-banner">Shared view — read-only.</p>
+        <div class="view-header">
+          <div>
+            <button type="button" class="btn-secondary btn-sm shared-back-btn" id="btn-shared-back">← Back</button>
+            <h2 id="shared-detail-name"></h2>
+            <p class="view-sub" id="shared-detail-url"></p>
+          </div>
+          <div class="header-actions">
+            <label class="run-headless-option">
+              <input type="checkbox" id="shared-run-headless" checked />
+              <span>Run in background (headless)</span>
+            </label>
+            <button type="button" class="btn-primary" id="shared-btn-run">▶ Run now</button>
+          </div>
+        </div>
+        <div class="two-col">
+          <div class="panel">
+            <p class="panel-label">Steps</p>
+            <ol id="shared-detail-steps" class="steps-list"></ol>
+          </div>
+          <div class="panel">
+            <p class="panel-label">Run output <span id="shared-run-status-badge"></span></p>
+            <div id="shared-run-output" class="run-output">
+              <p class="run-idle">Sign in and hit Run now.</p>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- Auth profiles management view -->
@@ -351,6 +407,19 @@
       <div class="spinner"></div>
       <p id="overlay-msg">Scanning site…</p>
       <p class="overlay-sub">This may take 30–60 seconds.</p>
+    </div>
+  </div>
+
+  <!-- Share link modal (owner) -->
+  <div id="share-overlay" class="auth-overlay hidden" aria-hidden="true">
+    <div class="auth-modal share-modal" role="dialog" aria-labelledby="share-modal-title" aria-modal="true">
+      <button type="button" class="auth-modal-close" id="share-modal-close" aria-label="Close">×</button>
+      <h2 class="auth-modal-title" id="share-modal-title">Share this site</h2>
+      <p class="auth-modal-lead">Anyone with the link can <strong>view</strong> all scenarios for this site. They must <strong>sign in</strong> to run them.</p>
+      <button type="button" class="btn-primary full-width" id="btn-share-create">Create new link</button>
+      <p class="panel-label share-links-label">Your links</p>
+      <ul id="share-links-list" class="share-links-list"></ul>
+      <p class="hint" id="share-modal-hint"></p>
     </div>
   </div>
 

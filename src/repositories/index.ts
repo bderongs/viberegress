@@ -9,6 +9,7 @@ import { createArtifactRepository as createArtifactRepositoryPg } from './postgr
 import { createDiscoveryRepository as createDiscoveryRepositoryPg } from './postgres-discovery.js';
 import { createScenarioVersionRepository as createScenarioVersionRepositoryPg } from './postgres-scenario-version.js';
 import { createAuthProfileRepository as createAuthProfileRepositoryPg } from './postgres-auth-profile.js';
+import { createSiteShareLinkRepository as createSiteShareLinkRepositoryPg } from './postgres-site-share.js';
 import type {
   ScenarioRepository,
   RunRepository,
@@ -18,6 +19,7 @@ import type {
   ScenarioVersionRepository,
   RunStepRepository,
   AuthProfileRepository,
+  SiteShareLinkRepository,
 } from './interfaces.js';
 
 let scenarioRepo: ScenarioRepository | null = null;
@@ -28,6 +30,7 @@ let artifactRepo: ArtifactRepository | null = null;
 let discoveryRepo: DiscoveryRepository | null = null;
 let scenarioVersionRepo: ScenarioVersionRepository | null = null;
 let authProfileRepo: AuthProfileRepository | null = null;
+let siteShareLinkRepo: SiteShareLinkRepository | null = null;
 
 export function getScenarioRepository(): ScenarioRepository {
   if (!scenarioRepo) scenarioRepo = createScenarioRepositoryPg();
@@ -69,6 +72,11 @@ export function getAuthProfileRepository(): AuthProfileRepository {
   return authProfileRepo;
 }
 
+export function getSiteShareLinkRepository(): SiteShareLinkRepository {
+  if (!siteShareLinkRepo) siteShareLinkRepo = createSiteShareLinkRepositoryPg();
+  return siteShareLinkRepo;
+}
+
 export type {
   ScenarioRepository,
   RunRepository,
@@ -78,5 +86,6 @@ export type {
   ScenarioVersionRepository,
   RunStepRepository,
   AuthProfileRepository,
+  SiteShareLinkRepository,
 };
 export type { RunArtifactRecord, DiscoveryRecord, ScenarioVersionRecord, RunStepRecord } from './interfaces.js';

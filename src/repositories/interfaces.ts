@@ -36,6 +36,26 @@ export interface ScenarioRepository {
   ): MaybePromise<void>;
   /** Reassign anonymous session scenarios to a signed-in user. Returns rows updated. */
   claimAnonymousToUser(sessionId: string, userId: string): MaybePromise<number>;
+  listByUserIdAndSiteNormalized(userId: string, siteUrlNormalized: string): MaybePromise<Scenario[]>;
+}
+
+export interface SiteShareLinkRecord {
+  id: string;
+  token: string;
+  ownerUserId: string;
+  siteUrl: string;
+  createdAt: string;
+  revokedAt: string | null;
+  expiresAt: string | null;
+  allowPublicRead: boolean;
+}
+
+export interface SiteShareLinkRepository {
+  create(ownerUserId: string, siteUrlNormalized: string): MaybePromise<SiteShareLinkRecord>;
+  listByOwnerAndSite(ownerUserId: string, siteUrlNormalized: string): MaybePromise<SiteShareLinkRecord[]>;
+  listRecentByOwner(ownerUserId: string, limit: number): MaybePromise<SiteShareLinkRecord[]>;
+  revoke(ownerUserId: string, linkId: string): MaybePromise<boolean>;
+  getActiveByToken(token: string): MaybePromise<SiteShareLinkRecord | undefined>;
 }
 
 export interface RunRepository {

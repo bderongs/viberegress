@@ -169,5 +169,16 @@ export function createScenarioRepository(): ScenarioRepository {
       );
       return result.rowCount ?? 0;
     },
+
+    async listByUserIdAndSiteNormalized(userId: string, siteUrlNormalized: string): Promise<Scenario[]> {
+      const n = (siteUrlNormalized || '').replace(/\/$/, '');
+      const result = await pool.query<Row>(
+        `SELECT * FROM scenarios WHERE owner_type = 'user' AND owner_id = $1 ORDER BY created_at DESC`,
+        [userId]
+      );
+      return result.rows
+        .filter((row) => (row.site_url || '').replace(/\/$/, '') === n)
+        .map(rowToScenario);
+    },
   };
 }
