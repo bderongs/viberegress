@@ -1137,6 +1137,23 @@ router.get('/runs/:runId/steps/:stepIndex/snapshot', async (req: Request, res: R
   res.sendFile(path.resolve(snapshotPath));
 });
 
+router.get('/runs/:runId/steps/:stepIndex/action-log', async (req: Request, res: Response) => {
+  const { runId, stepIndex } = req.params;
+  if (!(await runBelongsToOwner(runId, req.owner))) {
+    return res.status(404).json({ error: 'Action log not found' });
+  }
+  const parsedStepIndex = Number.parseInt(stepIndex, 10);
+  if (!Number.isInteger(parsedStepIndex) || parsedStepIndex < 0) {
+    return res.status(400).json({ error: 'Invalid step index' });
+  }
+  const actionLogPath = path.join(getArtifactDir(runId, parsedStepIndex), 'action-log.json');
+  if (!fs.existsSync(actionLogPath)) {
+    return res.status(404).json({ error: 'Action log not found' });
+  }
+  res.setHeader('Content-Type', 'application/json');
+  res.sendFile(path.resolve(actionLogPath));
+});
+
 /** Run details for in-app trace timeline: run + steps with redacted errors, traceUrl if present. */
 router.get('/runs/:runId/details', async (req: Request, res: Response) => {
   const { runId } = req.params;
@@ -1160,6 +1177,9 @@ router.get('/runs/:runId/details', async (req: Request, res: Response) => {
     error: s.error ? redactAuth(s.error) : null,
     snapshotUrl: fs.existsSync(path.join(getArtifactDir(runId, i), 'snapshot.jpg'))
       ? `/api/runs/${runId}/steps/${i}/snapshot`
+      : null,
+    actionLogUrl: fs.existsSync(path.join(getArtifactDir(runId, i), 'action-log.json'))
+      ? `/api/runs/${runId}/steps/${i}/action-log`
       : null,
   }));
 

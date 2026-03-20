@@ -79,6 +79,15 @@ run('validateAndNormalizeSteps ok for multi-field form steps', () => {
   }
 });
 
+run('FR multi-field form step is detected and normalized', () => {
+  const inst =
+    'Remplir le formulaire en tapant un prénom et une adresse email, puis cliquer sur le bouton de validation.';
+  assert.strictEqual(isInputLikeInstruction(inst), true);
+  const normalized = normalizeInputInstruction(inst);
+  assert.ok(normalized.includes('"Test User"'));
+  assert.ok(normalized.includes('"test@example.com"'));
+});
+
 run('validateAndNormalizeSteps returns ok and normalized steps for fixable scenario', () => {
   const result = validateAndNormalizeSteps(
     [

@@ -15,6 +15,169 @@ import { getAuthProfileRepository } from '../repositories/index.js';
 
 const TRACE_FILENAME = 'trace.zip';
 const STEP_SNAPSHOT_FILENAME = 'snapshot.jpg';
+const STEP_ACTION_LOG_FILENAME = 'action-log.json';
+const ATOMIC_ACTION_MAX_ATTEMPTS = 2;
+
+type AtomicActionKind = 'act' | 'verify';
+
+interface AtomicAction {
+  kind: AtomicActionKind;
+  label: string;
+  action?: string;
+  verifyInstruction?: string;
+  targetHint?: string;
+}
+
+interface AtomicActionLog {
+  kind: AtomicActionKind;
+  label: string;
+  attempt: number;
+  status: 'pass' | 'fail';
+  action?: string;
+  verifyInstruction?: string;
+  observeHint?: string;
+  error?: string;
+}
+
+function extractQuotedValues(instruction: string): string[] {
+  const out: string[] = [];
+  const re = /["']([^"']+)["']/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(instruction)) !== null) out.push(m[1]);
+  return out;
+}
+
+function hasSubmitIntent(instruction: string): boolean {
+  return /\b(click|tap|press)\b.*\b(submit|send|valider|confirm|continuer)\b/i.test(instruction);
+}
+
+export function planAtomicActionsForStep(instruction: string): AtomicAction[] | null {
+  const lower = instruction.toLowerCase();
+  const hasFirstName = /\b(first name|given name|prénom|prenom)\b/i.test(instruction);
+  const hasEmail = /\b(email address|email|adresse email|courriel)\b/i.test(instruction);
+
+  if (hasFirstName && hasEmail) {
+    const quoted = extractQuotedValues(instruction);
+    const firstNameValue = quoted[0] ?? 'Test User';
+    const emailValue = quoted[1] ?? 'test@example.com';
+    const actions: AtomicAction[] = [
+      {
+        kind: 'act',
+        label: 'fill_first_name',
+        targetHint: 'first name input (first name, given name, prénom)',
+        action: `Type "${firstNameValue}" in the first name field (first name, given name, prénom).`,
+      },
+      {
+        kind: 'verify',
+        label: 'verify_first_name',
+        verifyInstruction: `Confirm a first-name field (first name, given name, prénom) is currently filled with "${firstNameValue}".`,
+      },
+      {
+        kind: 'act',
+        label: 'fill_email',
+        targetHint: 'email input (email, email address, adresse email, courriel)',
+        action: `Type "${emailValue}" in the email field (email, email address, adresse email, courriel).`,
+      },
+      {
+        kind: 'verify',
+        label: 'verify_email',
+        verifyInstruction: `Confirm an email field (email, email address, adresse email, courriel) is currently filled with "${emailValue}".`,
+      },
+    ];
+    if (hasSubmitIntent(instruction)) {
+      actions.push({
+        kind: 'act',
+        label: 'submit_form',
+        targetHint: 'submit button',
+        action: 'Click the submit button to send the form.',
+      });
+    }
+    return actions;
+  }
+
+  return null;
+}
+
+async function observeTargetHint(
+  page: { observe?: (input: { instruction: string; iframes?: boolean }) => Promise<unknown> },
+  targetHint: string
+): Promise<string | undefined> {
+  if (!page.observe) return undefined;
+  try {
+    const observed = await page.observe({
+      instruction: `Find the best element for: ${targetHint}. Return the most relevant target.`,
+      iframes: true,
+    });
+    const asText = typeof observed === 'string' ? observed : JSON.stringify(observed);
+    return asText?.slice(0, 300);
+  } catch {
+    return undefined;
+  }
+}
+
+async function executeAtomicActions(
+  page: {
+    act: (input: { action: string; iframes?: boolean }) => Promise<unknown>;
+    extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<{ passed: boolean; reason: string }>;
+    observe?: (input: { instruction: string; iframes?: boolean }) => Promise<unknown>;
+  },
+  actions: AtomicAction[],
+  logs: AtomicActionLog[]
+): Promise<void> {
+  for (const action of actions) {
+    let success = false;
+    let lastError = '';
+    for (let attempt = 1; attempt <= ATOMIC_ACTION_MAX_ATTEMPTS; attempt++) {
+      let observeHint: string | undefined;
+      try {
+        if (action.kind === 'act') {
+          if (!action.action) throw new Error('Missing atomic action text');
+          let actionText = action.action;
+          if (attempt > 1 && action.targetHint) {
+            observeHint = await observeTargetHint(page, action.targetHint);
+            if (observeHint) {
+              actionText = `${action.action} Prefer target matching this observed hint: ${observeHint}`;
+            }
+          }
+          await page.act({ action: actionText, iframes: true });
+          logs.push({ kind: action.kind, label: action.label, attempt, status: 'pass', action: actionText, observeHint });
+        } else {
+          if (!action.verifyInstruction) throw new Error('Missing atomic verify instruction');
+          const result = await page.extract({
+            instruction: `${action.verifyInstruction} Return true only if clearly verified.`,
+            schema: z.object({ passed: z.boolean(), reason: z.string() }),
+            iframes: true,
+          });
+          if (!result.passed) throw new Error(result.reason || 'Verification failed');
+          logs.push({
+            kind: action.kind,
+            label: action.label,
+            attempt,
+            status: 'pass',
+            verifyInstruction: action.verifyInstruction,
+          });
+        }
+        success = true;
+        break;
+      } catch (err) {
+        lastError = err instanceof Error ? err.message : String(err);
+        logs.push({
+          kind: action.kind,
+          label: action.label,
+          attempt,
+          status: 'fail',
+          action: action.action,
+          verifyInstruction: action.verifyInstruction,
+          observeHint,
+          error: lastError,
+        });
+      }
+    }
+    if (!success) {
+      throw new Error(`Atomic action "${action.label}" failed: ${lastError}`);
+    }
+  }
+}
 
 /** Build Stagehand localBrowserLaunchOptions: base headless + optional auth cookies/headers. */
 function buildLaunchOptions(
@@ -195,6 +358,7 @@ export async function runScenario(
       options?.onStepStart?.(i, step.instruction, step.type);
       const start = Date.now();
 
+      let actionLogs: AtomicActionLog[] = [];
       try {
         if (step.type === 'assert') {
           // Assertions: verify a condition is true on the current page (include iframes for chat/widgets).
@@ -224,17 +388,31 @@ export async function runScenario(
               );
             }
           }
-          // act() with iframes: true so chat widgets and inputs inside iframes are found and used.
-          await page.act({ action: actionInstruction, iframes: true });
+          const plannedActions = planAtomicActionsForStep(actionInstruction);
+          if (plannedActions && plannedActions.length) {
+            await executeAtomicActions(page, plannedActions, actionLogs);
+          } else {
+            // act() with iframes: true so chat widgets and inputs inside iframes are found and used.
+            await page.act({ action: actionInstruction, iframes: true });
+            actionLogs.push({
+              kind: 'act',
+              label: 'single_step_act',
+              attempt: 1,
+              status: 'pass',
+              action: actionInstruction,
+            });
+          }
           // Allow dynamic content (modals, chat, iframes) to open before the next step.
           await new Promise((r) => setTimeout(r, POST_ACT_SETTLE_MS));
         }
 
         await captureStepSnapshot(page, runId, i);
+        await captureStepActionLog(runId, i, actionLogs);
         onStepComplete(i, 'pass', undefined, Date.now() - start);
       } catch (err) {
         const errorMsg = err instanceof Error ? err.message : String(err);
         await captureStepSnapshot(page, runId, i);
+        await captureStepActionLog(runId, i, actionLogs);
         onStepComplete(i, 'fail', errorMsg, Date.now() - start);
         return { passed: false, error: `Step ${i + 1} failed: ${errorMsg}`, tracePath: runId ? TRACE_FILENAME : undefined };
       }
@@ -271,5 +449,21 @@ async function captureStepSnapshot(
     });
   } catch {
     // Snapshot capture should never fail the run.
+  }
+}
+
+async function captureStepActionLog(
+  runId: string | undefined,
+  stepIndex: number,
+  actionLogs: AtomicActionLog[]
+): Promise<void> {
+  if (!runId) return;
+  const snapshotDir = getArtifactDir(runId, stepIndex);
+  fs.mkdirSync(snapshotDir, { recursive: true });
+  const logPath = path.join(snapshotDir, STEP_ACTION_LOG_FILENAME);
+  try {
+    fs.writeFileSync(logPath, JSON.stringify({ actions: actionLogs }, null, 2), 'utf8');
+  } catch {
+    // Action log capture should never fail the run.
   }
 }

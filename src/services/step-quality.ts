@@ -37,8 +37,8 @@ export function isInputLikeInstruction(instruction: string): boolean {
   // - Fill out the test form by typing a first name and an email address, then submit.
   if (
     /\b(typing|type|enter|fill|write|input)\b/i.test(lower) &&
-    /\b(first name|given name)\b/.test(lower) &&
-    /\b(email address|email)\b/.test(lower)
+    /\b(first name|given name|prénom|prenom)\b/.test(lower) &&
+    /\b(email address|email|adresse email|courriel)\b/.test(lower)
   ) {
     return true;
   }
@@ -80,7 +80,10 @@ export function normalizeInputInstruction(
   // Example:
   // - Fill out the test form by typing a first name and an email address, then submit.
   const lower = trimmed.toLowerCase();
-  if (/\b(first name|given name)\b/.test(lower) && /\b(email address|email)\b/.test(lower)) {
+  if (
+    /\b(first name|given name|prénom|prenom)\b/.test(lower) &&
+    /\b(email address|email|adresse email|courriel)\b/.test(lower)
+  ) {
     const thenMatch = /\bthen\b[\s\S]*$/i.exec(trimmed);
     let thenSuffix = '';
     if (thenMatch && thenMatch[0]) {
