@@ -31,6 +31,17 @@ export function isInputLikeInstruction(instruction: string): boolean {
   if (INPUT_VERBS.test(instruction)) return true;
   if (/\b(search|search for)\s+(something|a\s+keyword|a\s+term)\b/i.test(lower)) return true;
   if (/\b(in|into)\s+(the\s+)?(search|email|message|input|text|query)\s*(field|box|input)?\b/i.test(lower)) return true;
+
+  // Multi-field “fill the form by typing X and Y” style steps.
+  // Example:
+  // - Fill out the test form by typing a first name and an email address, then submit.
+  if (
+    /\b(typing|type|enter|fill|write|input)\b/i.test(lower) &&
+    /\b(first name|given name)\b/.test(lower) &&
+    /\b(email address|email)\b/.test(lower)
+  ) {
+    return true;
+  }
   return false;
 }
 
@@ -64,10 +75,29 @@ export function normalizeInputInstruction(
   if (!isInputLikeInstruction(trimmed)) return instruction;
   if (hasConcreteInputValue(trimmed)) return instruction;
 
+  // If the instruction asks for a form with both name + email but doesn't specify values,
+  // inject deterministic defaults for both fields.
+  // Example:
+  // - Fill out the test form by typing a first name and an email address, then submit.
+  const lower = trimmed.toLowerCase();
+  if (/\b(first name|given name)\b/.test(lower) && /\b(email address|email)\b/.test(lower)) {
+    const thenMatch = /\bthen\b[\s\S]*$/i.exec(trimmed);
+    let thenSuffix = '';
+    if (thenMatch && thenMatch[0]) {
+      const thenClause = thenMatch[0].trim(); // starts with "then"
+      thenSuffix = /,\s*then\b/i.test(trimmed) ? ', ' + thenClause : ' ' + thenClause;
+    }
+
+    return (
+      `Type "${DEFAULTS.name}" in the first name field and type "` +
+      `${DEFAULTS.email}" in the email address field` +
+      thenSuffix
+    ).replace(/\s+/g, ' ').trim();
+  }
+
   const kind = inferInputKind(trimmed, context);
   const value = DEFAULTS[kind];
 
-  const lower = trimmed.toLowerCase();
   // "Type a relevant keyword or phrase into the search textbox" -> "Type "pricing" into the search textbox"
   const verbInInto = /^(type|enter|fill|write|input)\s+.*?(\s+in\s+|\s+into\s+)(.*)$/i.exec(trimmed);
   if (verbInInto) {

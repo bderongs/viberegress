@@ -54,6 +54,31 @@ run('instruction with quoted value is unchanged', () => {
   assert.ok(hasConcreteInputValue(inst));
 });
 
+run('multi-field form step normalized (first name + email)', () => {
+  const inst =
+    'Fill out the test form by typing a first name and an email address, then click on the submit button.';
+  assert.strictEqual(isInputLikeInstruction(inst), true);
+
+  const normalized = normalizeInputInstruction(inst);
+  assert.ok(normalized.includes('"Test User"'), 'should inject default name');
+  assert.ok(normalized.includes('"test@example.com"'), 'should inject default email');
+  assert.ok(hasConcreteInputValue(normalized), 'normalized instruction must have concrete input values');
+});
+
+run('validateAndNormalizeSteps ok for multi-field form steps', () => {
+  const inst =
+    'Fill out the test form by typing a first name and an email address, then click on the submit button.';
+  const result = validateAndNormalizeSteps(
+    [{ instruction: inst, type: 'act' }],
+    { name: 'Signup', description: 'User signs up for the test' }
+  );
+  assert.strictEqual(result.ok, true);
+  if (result.ok) {
+    assert.ok(result.steps[0].instruction.includes('"Test User"'));
+    assert.ok(result.steps[0].instruction.includes('"test@example.com"'));
+  }
+});
+
 run('validateAndNormalizeSteps returns ok and normalized steps for fixable scenario', () => {
   const result = validateAndNormalizeSteps(
     [

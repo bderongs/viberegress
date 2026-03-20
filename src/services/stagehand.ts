@@ -3,7 +3,12 @@ import path from 'path';
 import { Stagehand, type LocalBrowserLaunchOptions } from '@browserbasehq/stagehand';
 import { z } from 'zod';
 import { getArtifactDir } from './artifact-store.js';
-import { validateAndNormalizeSteps, isInputLikeInstruction, hasConcreteInputValue } from './step-quality.js';
+import {
+  validateAndNormalizeSteps,
+  isInputLikeInstruction,
+  hasConcreteInputValue,
+  normalizeInputInstruction,
+} from './step-quality.js';
 import { DiscoveryResult, Step, AuthProfilePayload } from '../types/index.js';
 import type { Owner } from '../types/owner.js';
 import { getAuthProfileRepository } from '../repositories/index.js';
@@ -205,15 +210,22 @@ export async function runScenario(
             throw new Error(result.reason);
           }
         } else {
-          // Run-time guard: do not execute input-like steps without a concrete value (would produce fill("")).
+          // Runtime guard: input-like steps must have concrete values to type.
+          // If they don't, try to normalize them using deterministic defaults (better form-filling).
+          let actionInstruction = step.instruction;
           if (isInputLikeInstruction(step.instruction) && !hasConcreteInputValue(step.instruction)) {
-            throw new Error(
-              `Step ${i + 1} is an input action but has no concrete value to type. ` +
-              'Edit the scenario: use a quoted string in the instruction, e.g. Type "pricing" in the search box.'
-            );
+            const normalized = normalizeInputInstruction(step.instruction);
+            if (hasConcreteInputValue(normalized)) {
+              actionInstruction = normalized;
+            } else {
+              throw new Error(
+                `Step ${i + 1} is an input action but has no concrete value to type. ` +
+                  'Edit the scenario: use a quoted string in the instruction, e.g. Type "pricing" in the search box.'
+              );
+            }
           }
           // act() with iframes: true so chat widgets and inputs inside iframes are found and used.
-          await page.act({ action: step.instruction, iframes: true });
+          await page.act({ action: actionInstruction, iframes: true });
           // Allow dynamic content (modals, chat, iframes) to open before the next step.
           await new Promise((r) => setTimeout(r, POST_ACT_SETTLE_MS));
         }
