@@ -27,6 +27,15 @@ function isLoggedIn() {
   return !!accessToken;
 }
 
+function isLocalhostRuntime() {
+  const host = (window.location && window.location.hostname ? window.location.hostname : '').toLowerCase();
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+}
+
+function isAnonymousTrialLimited() {
+  return !isLocalhostRuntime();
+}
+
 function trialRunsUsed() {
   return Number(sessionStorage.getItem(TRIAL_RUNS_KEY) || '0');
 }
@@ -87,7 +96,9 @@ async function api(method, path, body) {
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText }));
-    throw new Error(err.error || res.statusText);
+    const e = new Error(err.error || res.statusText);
+    e.details = err;
+    throw e;
   }
   return res.json();
 }
@@ -122,12 +133,12 @@ function updateSiteRunAllButton() {
     btn.title = 'Batch run in progress';
     return;
   }
-  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2) {
     btn.disabled = true;
     btn.title = 'Sign up to run more scenarios';
     return;
   }
-  if (!isLoggedIn() && trialRunsRemaining() < n) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsRemaining() < n) {
     btn.disabled = true;
     btn.title =
       'Trial: ' +
@@ -147,7 +158,7 @@ function updateSiteRunAllButton() {
 }
 
 function runButtonStateForRunBtn() {
-  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2) {
     return { disabled: true, title: 'Sign up to run more scenarios' };
   }
   if (isLoggedIn() && monthlyUsageCache && monthlyUsageCache.atLimit) {
@@ -750,8 +761,13 @@ function updateAuthChrome() {
     if (btnAcct) btnAcct.classList.remove('hidden');
   } else {
     banner.hidden = false;
-    const left = trialRunsRemaining();
-    runsText.textContent = left > 0 ? left + ' free run' + (left === 1 ? '' : 's') + ' left' : 'No runs left — sign up to continue';
+    if (isAnonymousTrialLimited()) {
+      const left = trialRunsRemaining();
+      runsText.textContent =
+        left > 0 ? left + ' free run' + (left === 1 ? '' : 's') + ' left' : 'No runs left — sign up to continue';
+    } else {
+      runsText.textContent = 'Unlimited runs on localhost';
+    }
     emailEl.textContent = 'Trial mode';
     const anonActions = $('auth-user-actions-anon');
     if (anonActions) anonActions.classList.remove('hidden');
@@ -1097,12 +1113,12 @@ async function runAllScenariosForSite() {
   const siteScenarios = scenarios.filter(s => (s.siteUrl || '') === selectedSiteUrl);
   if (!siteScenarios.length) return;
 
-  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2) {
     openAuthModal();
     switchAuthTab('signup');
     return;
   }
-  if (!isLoggedIn() && trialRunsRemaining() < siteScenarios.length) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsRemaining() < siteScenarios.length) {
     alert(
       'Trial allows ' +
         trialRunsRemaining() +
@@ -1583,6 +1599,55 @@ function escapeHtml(s) {
   return div.innerHTML;
 }
 
+function buildDiscoveryLogFallback(result, scenarios) {
+  const visitedPages = Array.isArray(result && result.visitedPages) ? result.visitedPages : [];
+  const intentTraces = Array.isArray(result && result.intentTraces) ? result.intentTraces : [];
+  const selectedCtas = result && result.crawlMeta && Array.isArray(result.crawlMeta.selectedCtas) ? result.crawlMeta.selectedCtas : [];
+  const crawlErrors = result && result.crawlMeta && Array.isArray(result.crawlMeta.crawlErrors) ? result.crawlMeta.crawlErrors : [];
+  const lines = [];
+  lines.push('DISCOVERY LOG');
+  lines.push(`siteUrl: ${result && result.siteUrl ? result.siteUrl : ''}`);
+  lines.push(`createdAt: ${new Date().toISOString()}`);
+  lines.push('');
+  lines.push(`SUMMARY`);
+  lines.push(`selectedCtaCount: ${selectedCtas.length}`);
+  lines.push(`visitedPageCount: ${visitedPages.length}`);
+  lines.push(`intentTraceCount: ${intentTraces.length}`);
+  lines.push(`scenarioCount: ${scenarios.length}`);
+  lines.push('');
+  lines.push(`SELECTED CTAS`);
+  lines.push(selectedCtas.length ? selectedCtas.map((c, i) => `${i + 1}. ${c}`).join('\n') : '- none');
+  lines.push('');
+  lines.push(`VISITED PAGES`);
+  lines.push(
+    visitedPages.length
+      ? visitedPages.map((p, i) => `${i + 1}. ${p.url || ''} | title=${p.title || ''} | requireAuth=${p.requireAuth ? 'yes' : 'no'}`).join('\n')
+      : '- none'
+  );
+  lines.push('');
+  lines.push(`INTENT TRACES`);
+  lines.push(
+    intentTraces.length
+      ? intentTraces
+          .map((t, i) => `${i + 1}. intent=${t.intent && t.intent.label ? t.intent.label : ''}\n   action=${t.intent && t.intent.actionInstruction ? t.intent.actionInstruction : ''}\n   outcomeUrl=${t.observedOutcome && t.observedOutcome.url ? t.observedOutcome.url : ''}\n   outcomeTitle=${t.observedOutcome && t.observedOutcome.title ? t.observedOutcome.title : ''}\n   requireAuth=${t.observedOutcome && t.observedOutcome.requireAuth ? 'yes' : 'no'}`)
+          .join('\n')
+      : '- none'
+  );
+  lines.push('');
+  lines.push(`FINAL SCENARIOS`);
+  lines.push(
+    scenarios.length
+      ? scenarios
+          .map((s, i) => `${i + 1}. ${s.name}\n   verificationStatus=${s.verificationStatus || 'unknown'}\n   verificationError=${s.verificationError || ''}\n   steps:\n${(s.steps || []).map((step, idx) => `     ${idx + 1}. [${step.type}] ${step.instruction}`).join('\n')}`)
+          .join('\n')
+      : '- none'
+  );
+  lines.push('');
+  lines.push(`CRAWL ERRORS`);
+  lines.push(crawlErrors.length ? crawlErrors.map((e, i) => `${i + 1}. ${e}`).join('\n') : '- none');
+  return lines.join('\n');
+}
+
 // ─── Scan / discover ─────────────────────────────────────────────────
 $('btn-new-site').onclick = () => {
   activeScenarioId = null;
@@ -1653,16 +1718,82 @@ function setHint(msg, isError = false) {
 
 // ─── Discovery view ───────────────────────────────────────────────────
 function renderDiscovery(result) {
-  $('discovery-title').textContent = `${result.scenarios.length} scenarios discovered`;
+  const allScenarios = Array.isArray(result.scenarios) ? result.scenarios : [];
+  const filtered = allScenarios;
+  $('discovery-title').textContent = `${filtered.length} scenarios discovered`;
   $('discovery-url').textContent = result.siteUrl;
 
-  $('discovery-list').innerHTML = result.scenarios.map((s, i) => `
+  const visitedPages = Array.isArray(result.visitedPages) ? result.visitedPages : [];
+  const intentTraces = Array.isArray(result.intentTraces) ? result.intentTraces : [];
+  const visitedHtml = visitedPages.length
+    ? `
+      <div class="discovery-visited panel">
+        <p class="panel-label">Visited pages (${visitedPages.length})</p>
+        <ul class="discovery-visited-list">
+          ${visitedPages.map((p) => `
+            <li class="discovery-visited-item">
+              <div class="discovery-visited-url">${escapeHtml(p.url || '')}</div>
+              <div class="discovery-visited-meta">
+                ${p.requireAuth ? '<span class="discovery-auth-badge">Auth</span>' : ''}
+                <span>${escapeHtml(p.title || '')}</span>
+              </div>
+              <div class="discovery-visited-summary">${escapeHtml(p.summary || '')}</div>
+            </li>
+          `).join('')}
+        </ul>
+      </div>
+    `
+    : '';
+
+  const traceHtml = intentTraces.length
+    ? `
+      <div class="discovery-traces panel">
+        <p class="panel-label">How discovered (${intentTraces.length})</p>
+        <ul class="discovery-trace-list">
+          ${intentTraces.map((t) => `
+            <li class="discovery-trace-item">
+              <div class="discovery-trace-head">
+                <span class="discovery-trace-intent">${escapeHtml(t.intent.label || '')}</span>
+                <span class="discovery-trace-class">${escapeHtml(t.observedOutcome.pageClass || '')}</span>
+                ${t.observedOutcome.requireAuth ? '<span class="discovery-auth-badge">Auth required</span>' : ''}
+              </div>
+              <div class="discovery-trace-url">${escapeHtml(t.observedOutcome.url || '')}</div>
+              <div class="discovery-trace-summary">${escapeHtml(t.observedOutcome.summary || '')}</div>
+            </li>
+          `).join('')}
+        </ul>
+      </div>
+    `
+    : '';
+
+  const discoveryLogText = (result && typeof result.discoveryLog === 'string' && result.discoveryLog.trim())
+    ? result.discoveryLog
+    : buildDiscoveryLogFallback(result, filtered);
+  const discoveryLogHtml = `
+    <div class="discovery-log panel">
+      <div class="discovery-log-head">
+        <p class="panel-label">Discovery full log</p>
+        <button type="button" class="btn-secondary btn-sm" id="discovery-log-copy">Copy log</button>
+      </div>
+      <textarea id="discovery-log-text" class="input mono" rows="14" readonly>${escapeHtml(discoveryLogText)}</textarea>
+    </div>
+  `;
+
+  $('discovery-list').innerHTML = discoveryLogHtml + visitedHtml + traceHtml + filtered.map((s, i) => `
     <div class="scenario-card" data-index="${i}">
       <div class="scenario-card-header">
         <div>
           <div class="scenario-card-name">${s.name}</div>
           <div class="scenario-card-desc">${s.description}</div>
+          <div class="discovery-scenario-meta">
+            ${s.requireAuth ? '<span class="discovery-auth-badge">Auth required</span>' : ''}
+            ${s.verificationStatus ? `<span class="discovery-verif-badge ${escapeHtml(s.verificationStatus)}" title="${escapeHtml(s.verificationError || '')}">${escapeHtml(s.verificationStatus)}</span>` : ''}
+            ${s.intentDrift && s.intentDrift.detected ? `<span class="discovery-auth-badge" title="${escapeHtml(s.intentDrift.reason || '')}">Intent drift</span>` : ''}
+          </div>
         </div>
+        <button type="button" class="btn-${s.verificationStatus === 'unverified' ? 'secondary' : 'primary'} btn-sm discovery-save-one" data-index="${i}">
+          ${s.verificationStatus === 'unverified' ? 'Save & auto-repair' : 'Save'}
+        </button>
       </div>
       <div class="scenario-card-steps">
         ${s.steps.map((step, j) => `
@@ -1673,8 +1804,87 @@ function renderDiscovery(result) {
           </div>
         `).join('')}
       </div>
+      <p class="hint discovery-card-hint" id="discovery-card-hint-${i}" style="display:none;"></p>
+      <div class="discovery-card-trace hidden" id="discovery-card-trace-${i}"></div>
     </div>
   `).join('');
+  $('discovery-list').querySelectorAll('.discovery-save-one').forEach((btn) => {
+    btn.onclick = () => saveOneDiscoveredScenario(Number(btn.dataset.index));
+  });
+  const copyBtn = $('discovery-log-copy');
+  const logBox = $('discovery-log-text');
+  if (copyBtn && logBox) {
+    copyBtn.onclick = async () => {
+      const text = logBox.value || '';
+      try {
+        await navigator.clipboard.writeText(text);
+        const prev = copyBtn.textContent;
+        copyBtn.textContent = 'Copied';
+        setTimeout(() => {
+          copyBtn.textContent = prev;
+        }, 1200);
+      } catch (_) {
+        logBox.focus();
+        logBox.select();
+      }
+    };
+  }
+}
+
+async function saveOneDiscoveredScenario(index) {
+  if (!discoveredScenarios || !discoveredScenarios.scenarios || !discoveredScenarios.scenarios[index]) return;
+  const scenario = discoveredScenarios.scenarios[index];
+  const card = document.querySelector(`.scenario-card[data-index="${index}"]`);
+  const hint = $(`discovery-card-hint-${index}`);
+  const traceBox = $(`discovery-card-trace-${index}`);
+  const button = card ? card.querySelector('.discovery-save-one') : null;
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Saving…';
+  }
+  if (hint) {
+    hint.style.display = 'none';
+    hint.textContent = '';
+  }
+  if (traceBox) {
+    traceBox.classList.add('hidden');
+    traceBox.innerHTML = '';
+  }
+  try {
+    await api('POST', '/scenarios/save-one-from-discovery', { scenario });
+    discoveredScenarios.scenarios.splice(index, 1);
+    await loadScenarios();
+    if (!discoveredScenarios.scenarios.length) {
+      discoveredScenarios = null;
+      showView('welcome');
+      return;
+    }
+    renderDiscovery(discoveredScenarios);
+  } catch (err) {
+    const details = err && err.details ? err.details : null;
+    if (hint) {
+      hint.style.display = 'block';
+      hint.className = 'hint discovery-card-hint error';
+      hint.textContent = 'Failed to save: ' + (err.message || String(err));
+    }
+    if (traceBox && details && Array.isArray(details.buildLogs) && details.buildLogs.length) {
+      traceBox.classList.remove('hidden');
+      traceBox.innerHTML = details.buildLogs.map((event) => {
+        const cls = event.level === 'warn' || event.level === 'error' ? 'scenario-log-row warn' : 'scenario-log-row';
+        return `
+          <div class="${cls}">
+            <span class="scenario-log-time">${escapeHtml(new Date(event.occurredAt).toLocaleString())}</span>
+            <span class="scenario-log-text">${escapeHtml(formatScenarioBuildEventText(event))}</span>
+            ${renderScenarioTraceDetails(event && event.payload ? event.payload.trace : null)}
+          </div>
+        `;
+      }).join('');
+    }
+    if (button) {
+      button.disabled = false;
+      button.textContent = scenario.verificationStatus === 'unverified' ? 'Save & auto-repair' : 'Save';
+    }
+  }
 }
 
 $('btn-save-all').onclick = async () => {
@@ -1692,6 +1902,98 @@ $('btn-save-all').onclick = async () => {
   }
 };
 
+function formatScenarioBuildEventText(event) {
+  const p = event && event.payload ? event.payload : {};
+  const modeLabel =
+    p.mode === 'modify_before_run' ? 'modify'
+      : p.mode === 'discovery' ? 'discovery'
+      : 'create';
+  switch (event.eventType) {
+    case 'scenario_generation_started':
+      return `Generation started (${modeLabel}).`;
+    case 'scenario_verification_attempted':
+      return `Verification attempt ${p.attempt} (${p.stepCount} steps).`;
+    case 'scenario_verification_succeeded':
+      return `Verification passed (attempt ${p.attempt}, ${p.stepCount} steps).`;
+    case 'scenario_verification_failed':
+      return `Verification failed (attempt ${p.attempt}): ${p.error || 'Unknown error'}`;
+    case 'scenario_repair_attempted':
+      return `Auto-repair attempt ${p.attempt} started after verification failure.`;
+    case 'scenario_repair_succeeded':
+      return `Auto-repair produced ${p.stepCount} steps (attempt ${p.attempt}).`;
+    case 'scenario_generation_failed':
+      return `Generation failed (${modeLabel}): ${p.error || 'Unknown error'}`;
+    case 'scenario_saved':
+      return `Scenario saved (${p.stepCount} steps).`;
+    default:
+      return `${event.eventType}`;
+  }
+}
+
+function renderScenarioTraceDetails(trace) {
+  if (!trace) return '';
+  const sections = [];
+  if (trace.intent) {
+    sections.push(`<details class="scenario-log-details"><summary>Intent</summary><pre>${escapeHtml(trace.intent)}</pre></details>`);
+  }
+  if (trace.verificationError) {
+    sections.push(`<details class="scenario-log-details"><summary>Verification error</summary><pre>${escapeHtml(trace.verificationError)}</pre></details>`);
+  }
+  if (trace.repairPrompt) {
+    sections.push(`<details class="scenario-log-details"><summary>Repair prompt</summary><pre>${escapeHtml(trace.repairPrompt)}</pre></details>`);
+  }
+  if (trace.candidateBeforeRepair) {
+    const c = trace.candidateBeforeRepair;
+    sections.push(
+      `<details class="scenario-log-details"><summary>Candidate before repair</summary><pre>${escapeHtml(
+        `${c.name}\n${c.description}\n\n${(c.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+      )}</pre></details>`
+    );
+  }
+  if (trace.aiRewrite) {
+    const c = trace.aiRewrite;
+    sections.push(
+      `<details class="scenario-log-details"><summary>AI rewrite</summary><pre>${escapeHtml(
+        `${c.name}\n${c.description}\n\n${(c.steps || []).map((s, i) => `${i + 1}. ${s}`).join('\n')}`
+      )}</pre></details>`
+    );
+  }
+  if (trace.rerunResult) {
+    const r = trace.rerunResult;
+    sections.push(
+      `<details class="scenario-log-details"><summary>Re-run result</summary><pre>${escapeHtml(
+        `passed: ${r.passed ? 'true' : 'false'}${r.error ? `\nerror: ${r.error}` : ''}`
+      )}</pre></details>`
+    );
+  }
+  return sections.join('');
+}
+
+async function loadScenarioBuildLogs(scenarioId) {
+  const container = $('scenario-build-logs');
+  if (!container) return;
+  container.innerHTML = '<p class="run-idle">Loading generation logs…</p>';
+  try {
+    const events = await api('GET', `/scenarios/${scenarioId}/build-logs`);
+    if (!events || !events.length) {
+      container.innerHTML = '<p class="run-idle">No generation logs yet.</p>';
+      return;
+    }
+    container.innerHTML = events.slice(-25).map((event) => {
+      const cls = event.level === 'warn' || event.level === 'error' ? 'scenario-log-row warn' : 'scenario-log-row';
+      return `
+        <div class="${cls}">
+          <span class="scenario-log-time">${escapeHtml(new Date(event.occurredAt).toLocaleString())}</span>
+          <span class="scenario-log-text">${escapeHtml(formatScenarioBuildEventText(event))}</span>
+          ${renderScenarioTraceDetails(event && event.payload ? event.payload.trace : null)}
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    container.innerHTML = `<p class="run-idle">Could not load generation logs: ${escapeHtml(err.message || String(err))}</p>`;
+  }
+}
+
 // ─── Scenario detail ─────────────────────────────────────────────────
 async function openScenario(id) {
   activeScenarioId = id;
@@ -1701,6 +2003,7 @@ async function openScenario(id) {
   if (!s) return;
 
   if (isLoggedIn()) await refreshMonthlyUsage();
+  await loadScenarioBuildLogs(id);
 
   $('detail-name').textContent = s.name;
   $('detail-url').textContent = s.siteUrl;
@@ -1963,6 +2266,7 @@ async function addStepWithAI(addAfterIndex, userMessage) {
     `Insert exactly one new step ${locationText}.`,
     'Keep all existing steps in the same order and unchanged.',
     'Do not rename the scenario and do not change the description.',
+    'Make the new step verifiable using stable, visible UI outcomes; avoid transient/intermediate state checks unless explicitly requested.',
     `New step request: ${userMessage}`,
   ].join(' ');
   return await api('POST', `/scenarios/${activeScenarioId}/modify-before-run`, { userMessage: constrainedPrompt });
@@ -2054,6 +2358,40 @@ function restoreRunUiForScenario(scenarioId) {
   return true;
 }
 
+function renderDecisionLogSummary(log) {
+  const mode = log && log.executionMode ? String(log.executionMode) : 'unknown';
+  const finalStatus = log && log.finalStatus ? String(log.finalStatus) : 'unknown';
+  const finalError = log && log.finalError ? String(log.finalError) : '';
+  const assertReason = log && log.assertReason ? String(log.assertReason) : '';
+  const actions = Array.isArray(log && log.actions) ? log.actions : [];
+
+  const attemptsHtml = actions.length
+    ? actions
+        .map(a => {
+          const kind = a && a.kind ? String(a.kind) : 'act';
+          const attempt = a && a.attempt != null ? String(a.attempt) : '1';
+          const status = a && a.status ? String(a.status) : 'unknown';
+          const detail = a && (a.action || a.verifyInstruction)
+            ? String(a.action || a.verifyInstruction)
+            : '';
+          const extra = a && a.error ? ` — ${escapeHtml(String(a.error))}` : '';
+          return `<li><strong>${escapeHtml(kind)}</strong> attempt ${escapeHtml(attempt)}: <span class="trace-step-status ${escapeHtml(
+            status
+          )}">${escapeHtml(status)}</span>${detail ? ` — ${escapeHtml(detail)}` : ''}${extra}</li>`;
+        })
+        .join('')
+    : '<li>No detailed attempts recorded.</li>';
+
+  return `
+    <p><strong>Mode:</strong> ${escapeHtml(mode)}</p>
+    <p><strong>Final:</strong> <span class="trace-step-status ${escapeHtml(finalStatus)}">${escapeHtml(finalStatus)}</span>${
+      finalError ? ` — ${escapeHtml(finalError)}` : ''
+    }</p>
+    ${assertReason ? `<p><strong>Verify reason:</strong> ${escapeHtml(assertReason)}</p>` : ''}
+    <ul class="trace-step-decision-list">${attemptsHtml}</ul>
+  `;
+}
+
 async function loadAndRenderTraceDetails(runId) {
   const container = $('run-output');
   let panel = container.querySelector('.trace-details-panel');
@@ -2092,6 +2430,12 @@ async function loadAndRenderTraceDetails(runId) {
             <p class="trace-step-snapshot-hint" data-snapshot-hint>Loading snapshot…</p>
           </div>`
         : '<p class="trace-step-no-snapshot">No snapshot for this step.</p>';
+      const actionLogBlock = s.actionLogUrl
+        ? `<details class="trace-step-decision-details" data-action-log-wrap>
+            <summary>Decision log</summary>
+            <div class="trace-step-decision-content" data-action-log-url="${escapeAttr(s.actionLogUrl)}">Loading decision log…</div>
+          </details>`
+        : '<p class="trace-step-no-snapshot">No decision log for this step.</p>';
       const isOpen = s.status === 'fail' ? ' open' : '';
       stepEl.innerHTML = `
         <details class="trace-step-details"${isOpen}>
@@ -2104,6 +2448,7 @@ async function loadAndRenderTraceDetails(runId) {
           </summary>
           <div class="trace-step-body">
             ${snapshotBlock}
+            ${actionLogBlock}
             ${errBlock}
             <details class="trace-step-raw-details">
               <summary>Raw</summary>
@@ -2146,6 +2491,28 @@ async function loadAndRenderTraceDetails(runId) {
         }
       })
     );
+    const actionLogs = panel.querySelectorAll('[data-action-log-url]');
+    await Promise.all(
+      Array.from(actionLogs).map(async (logEl) => {
+        const actionLogUrl = logEl.getAttribute('data-action-log-url');
+        if (!actionLogUrl) return;
+        try {
+          const res = await fetch(actionLogUrl, { headers: runFetchHeaders(false) });
+          if (!res.ok) throw new Error('action_log_fetch_failed');
+          const log = await res.json();
+          const raw = JSON.stringify(log, null, 2);
+          logEl.innerHTML = `
+            ${renderDecisionLogSummary(log)}
+            <details class="trace-step-raw-details">
+              <summary>Raw JSON</summary>
+              <pre class="trace-step-raw">${escapeHtml(raw)}</pre>
+            </details>
+          `;
+        } catch (_) {
+          logEl.textContent = 'Decision log unavailable.';
+        }
+      })
+    );
   } catch (_) {
     // If details fail (e.g. run not found), skip trace panel
   }
@@ -2159,7 +2526,7 @@ async function runActiveScenario() {
   const scenario = scenarios.find(s => s.id === activeScenarioId);
   if (!scenario) return;
 
-  if (!isLoggedIn() && trialRunsUsed() >= 2) {
+  if (!isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2) {
     setScenarioHint('Trial limit reached. Sign up to run more scenarios.', true);
     openAuthModal();
     switchAuthTab('signup');
@@ -2303,8 +2670,11 @@ function handleRunEvent(event, scenario, currentRunId) {
     badge.innerHTML = `<span class="badge ${event.status}">${event.status}</span>`;
     const rb2 = $('btn-run');
     if (rb2 && !isLoggedIn()) {
-      rb2.disabled = !isLoggedIn() && trialRunsUsed() >= 2;
-      rb2.title = !isLoggedIn() && trialRunsUsed() >= 2 ? 'Sign up to run more scenarios' : '';
+      rb2.disabled = !isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2;
+      rb2.title =
+        !isLoggedIn() && isAnonymousTrialLimited() && trialRunsUsed() >= 2
+          ? 'Sign up to run more scenarios'
+          : '';
       rb2.textContent = '▶ Run again';
     } else if (rb2 && isLoggedIn()) {
       rb2.textContent = '▶ Run again';

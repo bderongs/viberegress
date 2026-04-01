@@ -75,6 +75,7 @@ export interface TelemetryEventRepository {
   appendMany(envelopes: TelemetryEventEnvelope<TelemetryPayload>[]): MaybePromise<void>;
   getByRunId(runId: string): MaybePromise<TelemetryEventEnvelope[]>;
   getByDiscoveryId(discoveryId: string): MaybePromise<TelemetryEventEnvelope[]>;
+  getByScenarioId(scenarioId: string): MaybePromise<TelemetryEventEnvelope[]>;
 }
 
 export interface RunArtifactRecord {

@@ -85,5 +85,13 @@ export function createTelemetryEventRepository(): TelemetryEventRepository {
       );
       return result.rows.map(rowToEnvelope);
     },
+
+    async getByScenarioId(scenarioId: string): Promise<TelemetryEventEnvelope[]> {
+      const result = await pool.query<TelemetryEventRow>(
+        'SELECT * FROM telemetry_events WHERE scenario_id = $1 ORDER BY occurred_at ASC',
+        [scenarioId]
+      );
+      return result.rows.map(rowToEnvelope);
+    },
   };
 }

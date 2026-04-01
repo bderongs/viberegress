@@ -63,6 +63,7 @@ User request: "${userMessage}"
 Rules:
 - Do what the user asked. If they say "don't do that step" or "remove step X", remove it. If they want different text or order, apply that.
 - Each step must remain a plain English instruction. Any step that involves typing MUST include the exact text in quotes (e.g. Type "pricing" in the search box).
+- Prefer assertions on stable, clearly visible end-state evidence. Avoid transient/intermediate checks (e.g. brief loading text like "Checking...") unless the user explicitly asks for that exact transient state.
 - Return name, description, and steps (array of instruction strings). Keep name/description unless the user asked to change them.`;
 }
 

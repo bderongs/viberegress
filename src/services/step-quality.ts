@@ -36,7 +36,7 @@ export function isInputLikeInstruction(instruction: string): boolean {
   // Example:
   // - Fill out the test form by typing a first name and an email address, then submit.
   if (
-    /\b(typing|type|enter|fill|write|input)\b/i.test(lower) &&
+    /\b(typing|type|enter|fill|write|input|taper|tapant|remplir)\b/i.test(lower) &&
     /\b(first name|given name|prénom|prenom)\b/.test(lower) &&
     /\b(email address|email|adresse email|courriel)\b/.test(lower)
   ) {

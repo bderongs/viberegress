@@ -9,6 +9,12 @@ export interface Scenario {
   description: string;
   steps: Step[];
   siteUrl: string;
+  /** Discovery/runtime hint: this scenario likely needs signed-in access. */
+  requireAuth?: boolean;
+  /** Discovery/runtime hint: how reliable this scenario currently is. */
+  verificationStatus?: 'verified' | 'repaired' | 'unverified';
+  /** Optional reason when verificationStatus is unverified. */
+  verificationError?: string;
   /** Optional URL where the scenario starts; must be same site as siteUrl. Falls back to siteUrl if unset. */
   startingWebpage?: string | null;
   createdAt: string;
@@ -16,6 +22,8 @@ export interface Scenario {
   lastStatus?: 'pass' | 'fail' | 'never';
   /** Optional auth profile to use when running this scenario. */
   authProfileId?: string | null;
+  /** Discovery hint: journey drifted from original CTA intent. */
+  intentDrift?: { detected: boolean; reason: string };
 }
 
 export interface Step {
@@ -44,6 +52,25 @@ export interface StepResult {
 
 export interface DiscoveryResult {
   siteUrl: string;
+  /** Full copy/paste log for discovery analysis and debugging. */
+  discoveryLog?: string;
+  intentTraces?: Array<{
+    intent: { label: string; actionInstruction: string; priority: number; sourceSection: string };
+    observedOutcome: {
+      url: string;
+      pageClass: string;
+      title: string;
+      requireAuth: boolean;
+      summary: string;
+    };
+    evidence: { headingSignals: string[]; primaryActions: string[] };
+  }>;
+  visitedPages?: Array<{ url: string; title: string; summary: string; requireAuth: boolean }>;
+  crawlMeta?: { selectedCtas: string[]; crawlErrors: string[] };
+  /** Heuristic target for how many scenarios this discovery aimed to produce. */
+  targetScenarioCount?: number;
+  /** Number of homepage intent candidates extracted before selection. */
+  candidateIntentCount?: number;
   scenarios: Omit<Scenario, 'id' | 'createdAt' | 'lastStatus'>[];
 }
 
@@ -92,13 +119,42 @@ export type TelemetryActor = 'api' | 'discovery' | 'scenario_build' | 'run';
 /** Discovery-flow event payloads */
 export type DiscoveryEventPayload =
   | { eventType: 'discovery_started'; siteUrl: string; headless: boolean; authProfileId?: string | null }
-  | { eventType: 'discovery_completed'; siteUrl: string; scenarioCount: number }
+  | {
+      eventType: 'discovery_completed';
+      siteUrl: string;
+      scenarioCount: number;
+      visitedPages?: Array<{ url: string; requireAuth: boolean }>;
+      selectedCtas?: string[];
+      crawlErrors?: string[];
+      intentCount?: number;
+      verifiedCount?: number;
+      repairedCount?: number;
+      unverifiedCount?: number;
+      targetScenarioCount?: number;
+      candidateIntentCount?: number;
+    }
   | { eventType: 'discovery_failed'; siteUrl: string; error: string };
 
 /** Scenario build/save flow event payloads */
+export interface ScenarioRepairTrace {
+  intent?: string;
+  verificationError?: string;
+  repairPrompt?: string;
+  candidateBeforeRepair?: { name: string; description: string; steps: string[] };
+  aiRewrite?: { name: string; description: string; steps: string[] };
+  rerunResult?: { passed: boolean; error?: string };
+}
+
 export type ScenarioBuildEventPayload =
   | { eventType: 'scenario_saved'; scenarioId: string; name: string; stepCount: number }
-  | { eventType: 'scenario_deleted'; scenarioId: string };
+  | { eventType: 'scenario_deleted'; scenarioId: string }
+  | { eventType: 'scenario_generation_started'; scenarioId: string; mode: 'create' | 'modify_before_run' | 'discovery'; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_verification_attempted'; scenarioId: string; attempt: number; stepCount: number; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_verification_succeeded'; scenarioId: string; attempt: number; stepCount: number; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_verification_failed'; scenarioId: string; attempt: number; error: string; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_repair_attempted'; scenarioId: string; attempt: number; error: string; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_repair_succeeded'; scenarioId: string; attempt: number; stepCount: number; trace?: ScenarioRepairTrace }
+  | { eventType: 'scenario_generation_failed'; scenarioId: string; mode: 'create' | 'modify_before_run' | 'discovery'; error: string; trace?: ScenarioRepairTrace };
 
 /** Run-flow event payloads */
 export type RunEventPayload =

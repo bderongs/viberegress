@@ -12,6 +12,7 @@ import {
   getScenarioVersionRepository,
   getAuthProfileRepository,
   getSiteShareLinkRepository,
+  getTelemetryEventRepository,
 } from '../repositories/index.js';
 import { scenarioToPublicJson, isValidShareTokenFormat } from '../lib/site-share.js';
 import { discoverScenarios, runScenario } from '../services/stagehand.js';
@@ -34,6 +35,7 @@ const SESSION_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 const MONTHLY_RUN_LIMIT = 20;
+const SCENARIO_VERIFY_MAX_REPAIRS = 1;
 
 function utcMonthWindow(): { periodStartUtc: string; periodEndExclusiveUtc: string } {
   const y = new Date().getUTCFullYear();
@@ -61,6 +63,281 @@ async function getSignedInMonthlyUsage(userId: string) {
     periodResetsAtUtc: periodEndExclusiveUtc,
     atLimit: used >= limit,
   };
+}
+
+interface ScenarioDraftResult {
+  name: string;
+  description: string;
+  steps: Scenario['steps'];
+}
+
+type ScenarioDraftInput = Omit<Scenario, 'id' | 'createdAt' | 'lastStatus'>;
+
+class ScenarioSaveError extends Error {
+  scenarioId: string;
+  constructor(message: string, scenarioId: string) {
+    super(message);
+    this.name = 'ScenarioSaveError';
+    this.scenarioId = scenarioId;
+  }
+}
+
+async function verifyAndRepairScenarioDraft(
+  draft: ScenarioDraftResult,
+  context: {
+    scenarioBase: Scenario;
+    owner: Owner;
+    originalUserMessage: string;
+    mode: 'create' | 'modify_before_run' | 'discovery';
+    requestId?: string;
+    traceId?: string;
+    maxRepairs?: number;
+  }
+): Promise<ScenarioDraftResult> {
+  const maxRepairs = context.maxRepairs ?? SCENARIO_VERIFY_MAX_REPAIRS;
+  let candidate: ScenarioDraftResult = {
+    name: draft.name,
+    description: draft.description,
+    steps: draft.steps,
+  };
+  let lastError = 'Unknown verification error';
+
+  for (let attempt = 0; attempt <= maxRepairs; attempt++) {
+    emitTelemetry(
+      {
+        eventType: 'scenario_verification_attempted',
+        scenarioId: context.scenarioBase.id,
+        attempt: attempt + 1,
+        stepCount: candidate.steps.length,
+        trace: {
+          intent: context.originalUserMessage,
+        },
+      },
+      'scenario_build',
+      'info',
+      {
+        scenarioId: context.scenarioBase.id,
+        requestId: context.requestId,
+        traceId: context.traceId,
+      }
+    );
+    const startUrl = context.scenarioBase.startingWebpage?.trim() || context.scenarioBase.siteUrl;
+    const runResult = await runScenario(
+      startUrl,
+      candidate.steps,
+      () => undefined,
+      {
+        headless: true,
+        authProfileId: context.scenarioBase.authProfileId ?? undefined,
+        owner: context.owner,
+      }
+    );
+
+    if (runResult.passed) {
+      emitTelemetry(
+        {
+          eventType: 'scenario_verification_succeeded',
+          scenarioId: context.scenarioBase.id,
+          attempt: attempt + 1,
+          stepCount: candidate.steps.length,
+          trace: {
+            intent: context.originalUserMessage,
+            rerunResult: { passed: true },
+          },
+        },
+        'scenario_build',
+        'info',
+        {
+          scenarioId: context.scenarioBase.id,
+          requestId: context.requestId,
+          traceId: context.traceId,
+        }
+      );
+      return candidate;
+    }
+
+    lastError = runResult.error || 'Unknown verification error';
+    emitTelemetry(
+      {
+        eventType: 'scenario_verification_failed',
+        scenarioId: context.scenarioBase.id,
+        attempt: attempt + 1,
+        error: lastError,
+        trace: {
+          intent: context.originalUserMessage,
+          verificationError: lastError,
+          rerunResult: { passed: false, error: lastError },
+        },
+      },
+      'scenario_build',
+      'warn',
+      {
+        scenarioId: context.scenarioBase.id,
+        requestId: context.requestId,
+        traceId: context.traceId,
+      }
+    );
+    if (attempt >= maxRepairs) break;
+    const repairPrompt = [
+      `Original user request: "${context.originalUserMessage}"`,
+      `Verification failed while replaying this scenario in a real browser: ${lastError}`,
+      'Rewrite the scenario so the steps are realistic and executable on this site.',
+      'Keep the same goal. Update assertions to match what actually happens after prior actions.',
+      'Do not return assumptions that are not visible or verifiable on the page.',
+    ].join('\n');
+    emitTelemetry(
+      {
+        eventType: 'scenario_repair_attempted',
+        scenarioId: context.scenarioBase.id,
+        attempt: attempt + 1,
+        error: lastError,
+        trace: {
+          intent: context.originalUserMessage,
+          verificationError: lastError,
+          repairPrompt,
+          candidateBeforeRepair: {
+            name: candidate.name,
+            description: candidate.description,
+            steps: candidate.steps.map((s) => s.instruction),
+          },
+        },
+      },
+      'scenario_build',
+      'info',
+      {
+        scenarioId: context.scenarioBase.id,
+        requestId: context.requestId,
+        traceId: context.traceId,
+      }
+    );
+
+    const scenarioForRepair: Scenario = {
+      ...context.scenarioBase,
+      name: candidate.name,
+      description: candidate.description,
+      steps: candidate.steps,
+    };
+    const repaired = await modifyScenarioWithAI({
+      scenario: scenarioForRepair,
+      mode: 'pre_run',
+      userMessage: repairPrompt,
+    });
+    candidate = {
+      name: repaired.name,
+      description: repaired.description,
+      steps: repaired.steps,
+    };
+    emitTelemetry(
+      {
+        eventType: 'scenario_repair_succeeded',
+        scenarioId: context.scenarioBase.id,
+        attempt: attempt + 1,
+        stepCount: candidate.steps.length,
+        trace: {
+          intent: context.originalUserMessage,
+          verificationError: lastError,
+          repairPrompt,
+          aiRewrite: {
+            name: candidate.name,
+            description: candidate.description,
+            steps: candidate.steps.map((s) => s.instruction),
+          },
+          rerunResult: { passed: false, error: lastError },
+        },
+      },
+      'scenario_build',
+      'info',
+      {
+        scenarioId: context.scenarioBase.id,
+        requestId: context.requestId,
+        traceId: context.traceId,
+      }
+    );
+  }
+
+  throw new Error(`Scenario verification failed after auto-repair: ${lastError}`);
+}
+
+async function saveScenarioDraftWithAutoRepair(
+  draftInput: ScenarioDraftInput,
+  owner: Owner,
+  context: {
+    mode: 'create' | 'modify_before_run' | 'discovery';
+    originalUserMessage: string;
+    requestId?: string;
+    traceId?: string;
+    scenarioId?: string;
+  }
+): Promise<Scenario> {
+  const startValidation = validateStartingWebpage(draftInput.startingWebpage, draftInput.siteUrl);
+  if (!startValidation.ok) throw new Error(startValidation.error);
+  const validated = validateAndNormalizeSteps(draftInput.steps, {
+    name: draftInput.name,
+    description: draftInput.description,
+  });
+  if (!validated.ok) {
+    throw new Error(validated.message);
+  }
+
+  const scenario: Scenario = {
+    ...draftInput,
+    steps: validated.steps as Scenario['steps'],
+    id: context.scenarioId ?? uuidv4(),
+    createdAt: new Date().toISOString(),
+    lastStatus: 'never',
+  };
+
+  emitTelemetry(
+    { eventType: 'scenario_generation_started', scenarioId: scenario.id, mode: context.mode, trace: { intent: context.originalUserMessage } },
+    'scenario_build',
+    'info',
+    { scenarioId: scenario.id, requestId: context.requestId, traceId: context.traceId }
+  );
+
+  try {
+    const verified = await verifyAndRepairScenarioDraft(
+      { name: scenario.name, description: scenario.description, steps: scenario.steps },
+      {
+        scenarioBase: scenario,
+        owner,
+        originalUserMessage: context.originalUserMessage,
+        mode: context.mode,
+        requestId: context.requestId,
+        traceId: context.traceId,
+      }
+    );
+    scenario.name = verified.name;
+    scenario.description = verified.description;
+    scenario.steps = verified.steps;
+
+    await getScenarioRepository().save(scenario, owner);
+    emitTelemetry(
+      { eventType: 'scenario_saved', scenarioId: scenario.id, name: scenario.name, stepCount: scenario.steps.length },
+      'scenario_build',
+      'info',
+      { scenarioId: scenario.id, requestId: context.requestId, traceId: context.traceId }
+    );
+    return scenario;
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emitTelemetry(
+      {
+        eventType: 'scenario_generation_failed',
+        scenarioId: scenario.id,
+        mode: context.mode,
+        error: msg,
+        trace: {
+          intent: context.originalUserMessage,
+          verificationError: msg,
+          rerunResult: { passed: false, error: msg },
+        },
+      },
+      'scenario_build',
+      'warn',
+      { scenarioId: scenario.id, requestId: context.requestId, traceId: context.traceId }
+    );
+    throw new ScenarioSaveError(msg, scenario.id);
+  }
 }
 
 export const router = Router();
@@ -232,6 +509,14 @@ router.get('/scenarios/:id', async (req: Request, res: Response) => {
   res.json(s);
 });
 
+router.get('/scenarios/:id/build-logs', async (req: Request, res: Response) => {
+  const scenario = await getScenarioRepository().getById(req.params.id, req.owner!);
+  if (!scenario) return res.status(404).json({ error: 'Not found' });
+  const events = await getTelemetryEventRepository().getByScenarioId(req.params.id);
+  const buildEvents = events.filter((e) => e.actor === 'scenario_build');
+  res.json(buildEvents);
+});
+
 router.patch('/scenarios/:id', async (req: Request, res: Response) => {
   const scenario = await getScenarioRepository().getById(req.params.id, req.owner!);
   if (!scenario) return res.status(404).json({ error: 'Not found' });
@@ -300,22 +585,22 @@ router.post('/scenarios/create-from-prompt', async (req: Request, res: Response)
       userMessage: userMessage.trim(),
       startUrl: startingWebpage ?? siteUrlTrimmed,
     });
-    const scenario: Scenario = {
-      id: uuidv4(),
-      name: result.name,
-      description: result.description,
-      steps: result.steps,
-      siteUrl: siteUrlTrimmed,
-      startingWebpage: startingWebpage ?? undefined,
-      createdAt: new Date().toISOString(),
-      lastStatus: 'never',
-    };
-    await getScenarioRepository().save(scenario, req.owner!);
-    emitTelemetry(
-      { eventType: 'scenario_saved', scenarioId: scenario.id, name: scenario.name, stepCount: scenario.steps.length },
-      'scenario_build',
-      'info',
-      { scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
+    const scenario = await saveScenarioDraftWithAutoRepair(
+      {
+        name: result.name,
+        description: result.description,
+        steps: result.steps,
+        siteUrl: siteUrlTrimmed,
+        startingWebpage: startingWebpage ?? undefined,
+        authProfileId: null,
+      },
+      req.owner!,
+      {
+        mode: 'create',
+        originalUserMessage: userMessage.trim(),
+        requestId: req.requestId,
+        traceId: req.traceId,
+      }
     );
     res.json(scenario);
   } catch (err) {
@@ -335,12 +620,59 @@ router.post('/scenarios/:id/modify-before-run', async (req: Request, res: Respon
   if (!scenario) return res.status(404).json({ error: 'Not found' });
 
   try {
+    emitTelemetry(
+      {
+        eventType: 'scenario_generation_started',
+        scenarioId: scenario.id,
+        mode: 'modify_before_run',
+        trace: { intent: userMessage.trim() },
+      },
+      'scenario_build',
+      'info',
+      { scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
+    );
     const result = await modifyScenarioWithAI({ scenario, mode: 'pre_run', userMessage: userMessage.trim() });
-    await repo.updateById(scenario.id, { name: result.name, description: result.description, steps: result.steps }, req.owner!);
+    const verified = await verifyAndRepairScenarioDraft(
+      {
+        name: result.name,
+        description: result.description,
+        steps: result.steps,
+      },
+      {
+        scenarioBase: {
+          ...scenario,
+          name: result.name,
+          description: result.description,
+          steps: result.steps,
+        },
+        owner: req.owner!,
+        originalUserMessage: userMessage.trim(),
+        mode: 'modify_before_run',
+        requestId: req.requestId,
+        traceId: req.traceId,
+      }
+    );
+    await repo.updateById(
+      scenario.id,
+      { name: verified.name, description: verified.description, steps: verified.steps },
+      req.owner!
+    );
     const updated = await repo.getById(scenario.id, req.owner!)!;
     res.json(updated);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    emitTelemetry(
+      {
+        eventType: 'scenario_generation_failed',
+        scenarioId: scenario.id,
+        mode: 'modify_before_run',
+        error: msg,
+        trace: { intent: userMessage.trim(), verificationError: msg, rerunResult: { passed: false, error: msg } },
+      },
+      'scenario_build',
+      'warn',
+      { scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
+    );
     res.status(400).json({ error: msg });
   }
 });
@@ -606,9 +938,25 @@ router.post('/discover', async (req: Request, res: Response) => {
       headless: headlessOpt,
       authProfileId: authProfileId || undefined,
       owner: req.owner!,
+      discoveryId,
+      requestId: req.requestId,
+      traceId: req.traceId,
     });
     emitTelemetry(
-      { eventType: 'discovery_completed', siteUrl: url, scenarioCount: result.scenarios.length },
+      {
+        eventType: 'discovery_completed',
+        siteUrl: url,
+        scenarioCount: result.scenarios.length,
+        visitedPages: (result.visitedPages || []).map((p) => ({ url: p.url, requireAuth: p.requireAuth })),
+        selectedCtas: result.crawlMeta?.selectedCtas || [],
+        crawlErrors: result.crawlMeta?.crawlErrors || [],
+        intentCount: (result.intentTraces || []).length,
+        verifiedCount: result.scenarios.filter((s) => s.verificationStatus === 'verified').length,
+        repairedCount: result.scenarios.filter((s) => s.verificationStatus === 'repaired').length,
+        unverifiedCount: result.scenarios.filter((s) => s.verificationStatus === 'unverified').length,
+        targetScenarioCount: result.targetScenarioCount,
+        candidateIntentCount: result.candidateIntentCount,
+      },
       'discovery',
       'info',
       { discoveryId, requestId: req.requestId, traceId: req.traceId }
@@ -627,51 +975,55 @@ router.post('/discover', async (req: Request, res: Response) => {
 });
 
 router.post('/scenarios', async (req: Request, res: Response) => {
-  const { scenarios } = req.body as { scenarios: Omit<Scenario, 'id' | 'createdAt' | 'lastStatus'>[] };
+  const { scenarios } = req.body as { scenarios: ScenarioDraftInput[] };
   if (!scenarios?.length) return res.status(400).json({ error: 'scenarios array required' });
-
+  const saved: Scenario[] = [];
   for (const s of scenarios) {
-    const v = validateStartingWebpage(s.startingWebpage, s.siteUrl);
-    if (!v.ok) return res.status(400).json({ error: v.error, scenarioName: s.name });
+    try {
+      const scenario = await saveScenarioDraftWithAutoRepair(
+        s,
+        req.owner!,
+        {
+          mode: 'discovery',
+          originalUserMessage: `Discovery scenario: ${s.name}`,
+          requestId: req.requestId,
+          traceId: req.traceId,
+        }
+      );
+      saved.push(scenario);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.status(400).json({ error: msg, scenarioName: s.name });
+    }
   }
-
-  const validatedList = scenarios.map(s => {
-    const validated = validateAndNormalizeSteps(s.steps, {
-      name: s.name,
-      description: s.description,
-    });
-    return { scenario: s, validated };
-  });
-  const firstFail = validatedList.find(({ validated }) => !validated.ok);
-  if (firstFail) {
-    const { scenario: s, validated } = firstFail;
-    return res.status(400).json({
-      error: (validated as { ok: false; stepIndex: number; message: string }).message,
-      stepIndex: (validated as { ok: false; stepIndex: number; message: string }).stepIndex,
-      scenarioName: s.name,
-    });
-  }
-
-  const repo = getScenarioRepository();
-  const saved = await Promise.all(validatedList.map(async ({ scenario: s, validated }) => {
-    const scenario: Scenario = {
-      ...s,
-      steps: (validated as { ok: true; steps: Scenario['steps'] }).steps,
-      id: uuidv4(),
-      createdAt: new Date().toISOString(),
-      lastStatus: 'never',
-    };
-    await repo.save(scenario, req.owner!);
-    emitTelemetry(
-      { eventType: 'scenario_saved', scenarioId: scenario.id, name: scenario.name, stepCount: scenario.steps.length },
-      'scenario_build',
-      'info',
-      { scenarioId: scenario.id, requestId: req.requestId, traceId: req.traceId }
-    );
-    return scenario;
-  }));
 
   res.json(saved);
+});
+
+router.post('/scenarios/save-one-from-discovery', async (req: Request, res: Response) => {
+  const { scenario } = req.body as { scenario?: ScenarioDraftInput };
+  if (!scenario) return res.status(400).json({ error: 'scenario is required' });
+  const scenarioId = uuidv4();
+  try {
+    const saved = await saveScenarioDraftWithAutoRepair(
+      scenario,
+      req.owner!,
+      {
+        mode: 'discovery',
+        originalUserMessage: `Discovery scenario: ${scenario.name}`,
+        requestId: req.requestId,
+        traceId: req.traceId,
+        scenarioId,
+      }
+    );
+    res.json(saved);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const failedScenarioId = err instanceof ScenarioSaveError ? err.scenarioId : scenarioId;
+    const events = await getTelemetryEventRepository().getByScenarioId(failedScenarioId);
+    const buildLogs = events.filter((e) => e.actor === 'scenario_build').slice(-40);
+    res.status(400).json({ error: msg, scenarioName: scenario.name, scenarioId: failedScenarioId, buildLogs });
+  }
 });
 
 function normalizeSiteUrlForMatch(url: string): string {
