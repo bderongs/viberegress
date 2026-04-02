@@ -83,6 +83,133 @@ interface JourneyDepthSignals {
   weakReason?: string;
 }
 
+/** Grounded form sketch from discovery page summarization (caps applied in normalizeFormSketch). */
+interface PageFormSketch {
+  hasMeaningfulForm: boolean;
+  formFields: Array<{
+    label: string;
+    controlKind: 'text' | 'email' | 'textarea' | 'select' | 'other';
+    requiredGuess: boolean;
+    optionLabels?: string[];
+  }>;
+  submitActionLabels: string[];
+}
+
+const DISCOVERY_FORM_FIELD_CAP = 12;
+const DISCOVERY_SUBMIT_LABEL_CAP = 3;
+
+const discoveryFormFieldSchema = z.object({
+  label: z.string(),
+  controlKind: z.enum(['text', 'email', 'textarea', 'select', 'other']),
+  requiredGuess: z.boolean(),
+  optionLabels: z.array(z.string()).optional(),
+});
+
+const discoveryPageSummarySchema = z.object({
+  url: z.string(),
+  title: z.string(),
+  summary: z.string(),
+  headingSignals: z.array(z.string()),
+  primaryActions: z.array(z.string()),
+  hasMeaningfulForm: z.boolean(),
+  formFields: z.array(discoveryFormFieldSchema),
+  submitActionLabels: z.array(z.string()),
+});
+
+export type DiscoveryPageSummaryRaw = z.infer<typeof discoveryPageSummarySchema>;
+
+/** Exposed for tests and callers that need normalized discovery form metadata. */
+export function normalizeFormSketch(raw: DiscoveryPageSummaryRaw): PageFormSketch {
+  const formFields = (raw.formFields ?? [])
+    .slice(0, DISCOVERY_FORM_FIELD_CAP)
+    .map((f) => ({
+      label: (f.label || '').trim(),
+      controlKind: f.controlKind,
+      requiredGuess: Boolean(f.requiredGuess),
+      optionLabels: f.optionLabels?.filter((o) => (o || '').trim()).map((o) => o.trim()),
+    }))
+    .filter((f) => f.label.length > 0);
+  const submitActionLabels = (raw.submitActionLabels ?? [])
+    .map((s) => (s || '').trim())
+    .filter(Boolean)
+    .slice(0, DISCOVERY_SUBMIT_LABEL_CAP);
+  return {
+    hasMeaningfulForm: Boolean(raw.hasMeaningfulForm),
+    formFields,
+    submitActionLabels,
+  };
+}
+
+/** Exposed for tests. When true, discovery traces fill-then-submit instead of only click-hops. */
+export function shouldRunFormCompletionBranch(
+  lastObserved: { requireAuth: boolean; formSketch: PageFormSketch },
+  canContinuePastAuthGate: boolean
+): boolean {
+  if (lastObserved.requireAuth && !canContinuePastAuthGate) return false;
+  const s = lastObserved.formSketch;
+  if (!s.hasMeaningfulForm || s.submitActionLabels.length === 0 || s.formFields.length === 0) return false;
+  if (s.formFields.length >= 2) return true;
+  return s.formFields.some((f) => f.requiredGuess);
+}
+
+const SELECT_PLACEHOLDER_SKIP = /^(choose|select|--|—|choose a|sélectionner)/i;
+
+function pickSelectOptionValue(optionLabels: string[] | undefined, fieldLabel: string): string {
+  const opts = optionLabels?.filter((o) => (o || '').trim()) ?? [];
+  for (const o of opts) {
+    const t = o.trim();
+    if (t && !SELECT_PLACEHOLDER_SKIP.test(t)) return t;
+  }
+  if (opts[0]) return opts[0].trim();
+  return `Option for ${fieldLabel}`;
+}
+
+function placeholderForFormField(
+  field: PageFormSketch['formFields'][number],
+  index: number
+): string {
+  if (field.controlKind === 'select') {
+    return pickSelectOptionValue(field.optionLabels, field.label);
+  }
+  if (field.controlKind === 'email') return 'discovery-test@example.com';
+  if (field.controlKind === 'textarea') {
+    return 'Automated discovery test message. Please ignore.';
+  }
+  const lab = field.label.toLowerCase();
+  if (/\b(first|given|prénom|prenom)\b/i.test(lab)) return 'Discovery';
+  if (/\b(last|family|surname|nom de famille)\b/i.test(lab)) return 'TestUser';
+  if (/\bsubject\b|objet/i.test(lab)) return 'General question';
+  if (/\bname\b/i.test(lab) && !/user ?name|username/i.test(lab)) return index % 2 === 0 ? 'Discovery' : 'TestUser';
+  return 'TestValue';
+}
+
+function buildFormFillActInstruction(
+  field: PageFormSketch['formFields'][number],
+  value: string
+): string {
+  const L = field.label.replace(/"/g, "'");
+  switch (field.controlKind) {
+    case 'select':
+      return `Choose "${value}" from the ${L} dropdown or select control.`;
+    case 'textarea':
+      return `Type "${value}" into the ${L} multi-line message or text area field.`;
+    case 'email':
+      return `Type "${value}" into the ${L} email field.`;
+    default:
+      return `Type "${value}" into the ${L} field.`;
+  }
+}
+
+function pickSubmitClickInstruction(submitLabels: string[]): string {
+  const ranked = [...submitLabels].sort((a, b) => {
+    const pa = /\b(send|submit|envoyer|valider|continuer)\b/i.test(a) ? 0 : 1;
+    const pb = /\b(send|submit|envoyer|valider|continuer)\b/i.test(b) ? 0 : 1;
+    return pa - pb;
+  });
+  const label = (ranked[0] || submitLabels[0] || 'Submit').replace(/"/g, "'");
+  return `Click the ${label} button.`;
+}
+
 interface DiscoveryDebugEvent {
   stepKey: 'summarizeCurrentPage' | 'nextActionDecision' | 'replanDecision' | 'fallbackDeepen' | 'finalAssert';
   schemaName: string;
@@ -573,7 +700,7 @@ function hasOutcomeEvidenceFromObserved(observed: {
   const hay = `${observed.title} ${observed.summary} ${(observed.headingSignals || []).join(' ')} ${(observed.primaryActions || []).join(' ')}`.toLowerCase();
   return /(result|results|search|filter|category|categories|listing|catalog|item|session|book|booking|reserve|réserver|trouver|chercher|sélectionner|details|détails|continue|next|start|checkout|payment|pricing|plan)/i.test(
     hay
-  );
+  ) || /(thank you|thanks|sent|message sent|success|confirmation|well received|reçu)/i.test(hay);
 }
 
 function hasIntentArtifacts(intentLabel: string, observed: { title: string; summary: string; headingSignals: string[]; primaryActions: string[] }): boolean {
@@ -660,15 +787,9 @@ function buildScenarioDescription(input: {
 
 async function summarizeCurrentPage(
   page: {
-    extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<{
-      url: string;
-      title: string;
-      summary: string;
-      headingSignals: string[];
-      primaryActions: string[];
-    }>;
+    extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
   }
-): Promise<{ url: string; title: string; summary: string; headingSignals: string[]; primaryActions: string[] }> {
+): Promise<DiscoveryPageSummaryRaw> {
   return await page.extract({
     instruction: `Summarize this current page for scenario discovery.
 - Return current URL.
@@ -676,14 +797,13 @@ async function summarizeCurrentPage(
 - Return a short summary (1-2 sentences).
 - Return up to 5 visible heading signals.
 - Return up to 6 concrete primary clickable actions.
-Keep output factual and grounded in visible page content only.`,
-    schema: z.object({
-      url: z.string(),
-      title: z.string(),
-      summary: z.string(),
-      headingSignals: z.array(z.string()),
-      primaryActions: z.array(z.string()),
-    }),
+- Form sketch (same extract):
+  - hasMeaningfulForm: true only if there is a visible multi-control data-entry form (inputs, textareas, selects) users fill before a submit/send control. Single-email newsletter-only forms may count as meaningful.
+  - formFields: up to ${DISCOVERY_FORM_FIELD_CAP} fields in visible tab/document order; each label from visible label text or placeholder; controlKind: text | email | textarea | select | other; requiredGuess if the UI marks required or implies it; for selects include optionLabels with visible options (omit empty).
+  - submitActionLabels: up to ${DISCOVERY_SUBMIT_LABEL_CAP} visible submit/send button labels tied to that form.
+  If there is no such form, set hasMeaningfulForm=false, formFields=[], submitActionLabels=[].
+Keep output factual and grounded in visible page content only. Do not invent fields.`,
+    schema: discoveryPageSummarySchema,
     iframes: true,
   });
 }
@@ -698,6 +818,8 @@ async function extractIntentCandidates(
 Prioritize hero CTAs, primary nav and key product actions.
 Include auth CTAs (sign in/up/login/register) if visible.
 Exclude legal/footer links and destructive actions.
+
+Navigation vs forms: For intents that open a separate destination with a data form (Contact, Help, Support, Newsletter signup, Apply, Register when it navigates to a form page), actionInstruction MUST be the navigation click (nav link, hero/footer link) that REACHES that page — NOT the form submit/send button on the destination. Only use a submit instruction when the starting page is already the form and there is no navigation step.
 Return:
 - label
 - actionInstruction (single click instruction executable by Stagehand)
@@ -801,6 +923,7 @@ async function traceJourneyFromIntent(
     requireAuth: boolean;
     headingSignals: string[];
     primaryActions: string[];
+    formSketch: PageFormSketch;
   } | null = null;
 
   const compactContext = () => ({
@@ -886,31 +1009,13 @@ async function traceJourneyFromIntent(
 
   const doSummarize = async () => {
     const started = Date.now();
-    let observed: {
-      url: string;
-      title: string;
-      summary: string;
-      headingSignals: string[];
-      primaryActions: string[];
-    };
+    let observed: DiscoveryPageSummaryRaw;
     try {
-      observed = (await summarizeCurrentPage(
+      observed = await summarizeCurrentPage(
         page as unknown as {
-          extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<{
-            url: string;
-            title: string;
-            summary: string;
-            headingSignals: string[];
-            primaryActions: string[];
-          }>;
+          extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
         }
-      )) as {
-        url: string;
-        title: string;
-        summary: string;
-        headingSignals: string[];
-        primaryActions: string[];
-      };
+      );
       recordDebugEvent({
         stepKey: 'summarizeCurrentPage',
         schemaName: 'PageSummary',
@@ -942,6 +1047,7 @@ async function traceJourneyFromIntent(
       throw toTraceError(err, 'summarizeCurrentPage', hopTraces.length);
     }
 
+    const formSketch = normalizeFormSketch(observed);
     const normUrl = normalizeUrlForDiscovery(observed.url || '', baseOrigin);
     if (!normUrl || !sameSite(normUrl, baseUrl)) {
       return {
@@ -952,6 +1058,7 @@ async function traceJourneyFromIntent(
         requireAuth: false,
         headingSignals: observed.headingSignals || [],
         primaryActions: observed.primaryActions || [],
+        formSketch,
       };
     }
 
@@ -966,6 +1073,7 @@ async function traceJourneyFromIntent(
       requireAuth,
       headingSignals: observed.headingSignals || [],
       primaryActions: observed.primaryActions || [],
+      formSketch,
     };
   };
 
@@ -999,8 +1107,41 @@ async function traceJourneyFromIntent(
     },
   });
 
+  let skipJourneyClickLoop = false;
+  if (!isTerminalOutcome(lastObserved) && shouldRunFormCompletionBranch(lastObserved, canContinuePastAuthGate)) {
+    skipJourneyClickLoop = true;
+    const sketch = lastObserved.formSketch;
+    const formActInstructions: string[] = [];
+    sketch.formFields.forEach((field, index) => {
+      const value = placeholderForFormField(field, index);
+      formActInstructions.push(buildFormFillActInstruction(field, value));
+    });
+    formActInstructions.push(pickSubmitClickInstruction(sketch.submitActionLabels));
+
+    for (const instruction of formActInstructions) {
+      steps.push({ instruction, type: 'act' });
+      journeyActCount++;
+      usedActionKeys.add(instruction.toLowerCase().trim());
+      await page.act({ action: instruction, iframes: true });
+      await new Promise((r) => setTimeout(r, DISCOVERY_JOURNEY_SETTLE_MS));
+      lastObserved = await doSummarize();
+      hopTraces.push({
+        actionInstruction: instruction,
+        observedOutcome: {
+          url: lastObserved.url,
+          title: lastObserved.title,
+          summary: lastObserved.summary,
+          pageClass: lastObserved.pageClass,
+          requireAuth: lastObserved.requireAuth,
+          headingSignals: lastObserved.headingSignals,
+          primaryActions: lastObserved.primaryActions,
+        },
+      });
+    }
+  }
+
   // Continue until terminal outcome or step budget.
-  while (journeyActCount < 1 + DISCOVERY_JOURNEY_MAX_HOPS) {
+  while (!skipJourneyClickLoop && journeyActCount < 1 + DISCOVERY_JOURNEY_MAX_HOPS) {
     if (!lastObserved) break;
 
     // Terminal outcome reached.
@@ -1560,13 +1701,7 @@ export async function discoverScenarios(
     const crawlStart = Date.now();
 
     const home = await summarizeCurrentPage(page as unknown as {
-      extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<{
-        url: string;
-        title: string;
-        summary: string;
-        headingSignals: string[];
-        primaryActions: string[];
-      }>;
+      extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
     });
     visitedPages.push({
       url: home.url || baseUrl,

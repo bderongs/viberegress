@@ -95,5 +95,33 @@ run('step type inferred: act', () => {
   assert.strictEqual(result.steps[0].type, 'act');
 });
 
+run('compound add-step style output supports act then assert', () => {
+  const result = parseAndValidateModifyResult({
+    name: 'Checkout',
+    description: 'User starts checkout',
+    steps: [
+      'Click the Checkout button',
+      'Verify the checkout form is visible',
+    ],
+  });
+  assert.strictEqual(result.steps.length, 2);
+  assert.strictEqual(result.steps[0].type, 'act');
+  assert.strictEqual(result.steps[1].type, 'assert');
+});
+
+run('click and check phrasing can be represented as split steps', () => {
+  const result = parseAndValidateModifyResult({
+    name: 'Pricing',
+    description: 'User opens pricing and validates page',
+    steps: [
+      'Click the Pricing link in the top navigation',
+      'Verify the Pricing page heading is visible',
+    ],
+  });
+  assert.strictEqual(result.steps.length, 2);
+  assert.strictEqual(result.steps[0].type, 'act');
+  assert.strictEqual(result.steps[1].type, 'assert');
+});
+
 console.log('All scenario-modifier tests passed.');
 process.exit(0);

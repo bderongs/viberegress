@@ -2263,9 +2263,11 @@ async function addStepWithAI(addAfterIndex, userMessage) {
     ? 'at the end'
     : `after step ${Number(addAfterIndex) + 1}`;
   const constrainedPrompt = [
-    `Insert exactly one new step ${locationText}.`,
+    `Insert one or more new steps ${locationText}, with a maximum of 3 new steps.`,
     'Keep all existing steps in the same order and unchanged.',
     'Do not rename the scenario and do not change the description.',
+    'Each new step must be atomic and contain one primary intent.',
+    'If the request combines an action and a verification (for example "click ... and check ..."), split them into separate ordered steps (act first, then assert).',
     'Make the new step verifiable using stable, visible UI outcomes; avoid transient/intermediate state checks unless explicitly requested.',
     `New step request: ${userMessage}`,
   ].join(' ');
