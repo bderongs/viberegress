@@ -13,11 +13,19 @@ import {
   getAuthProfileRepository,
   getSiteShareLinkRepository,
   getTelemetryEventRepository,
+  getDiscoveryRepository,
+  getContentCheckRepository,
 } from '../repositories/index.js';
 import { scenarioToPublicJson, isValidShareTokenFormat } from '../lib/site-share.js';
-import { discoverScenarios, runScenario } from '../services/stagehand.js';
+import { discoverScenarios, previewSite, runContentCheck, runScenario } from '../services/stagehand.js';
 import { validateAndNormalizeSteps } from '../services/step-quality.js';
-import { modifyScenarioWithAI, createScenarioFromPrompt, modifyScenarioStepWithAI } from '../services/scenario-modifier.js';
+import {
+  modifyScenarioWithAI,
+  createScenarioFromPrompt,
+  modifyScenarioStepWithAI,
+} from '../services/scenario-modifier.js';
+import { formatPageStoryForPrompt, STORY_FALLBACK_RULES } from '../services/page-story.js';
+import type { PageStory } from '../services/page-story.js';
 import { Scenario, TestRun, AuthProfile, AuthProfilePayload } from '../types/index.js';
 import { emitTelemetry } from '../lib/telemetry.js';
 import { writeArtifact, getArtifactDir } from '../services/artifact-store.js';
@@ -33,6 +41,10 @@ import type { Owner } from '../types/owner.js';
 
 const SESSION_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isContentCheckEnabled(): boolean {
+  return process.env.CONTENT_CHECK_ENABLED !== 'false';
+}
 
 const MONTHLY_RUN_LIMIT = 20;
 const SCENARIO_VERIFY_MAX_REPAIRS = 1;
@@ -92,6 +104,8 @@ async function verifyAndRepairScenarioDraft(
     requestId?: string;
     traceId?: string;
     maxRepairs?: number;
+    /** Structured narrative from the start URL; strengthens repair prompts when set. */
+    pageStory?: PageStory | null;
   }
 ): Promise<ScenarioDraftResult> {
   const maxRepairs = context.maxRepairs ?? SCENARIO_VERIFY_MAX_REPAIRS;
@@ -178,12 +192,16 @@ async function verifyAndRepairScenarioDraft(
       }
     );
     if (attempt >= maxRepairs) break;
+    const narrativeRepair =
+      context.pageStory != null ? formatPageStoryForPrompt(context.pageStory) : STORY_FALLBACK_RULES;
     const repairPrompt = [
       `Original user request: "${context.originalUserMessage}"`,
       `Verification failed while replaying this scenario in a real browser: ${lastError}`,
       'Rewrite the scenario so the steps are realistic and executable on this site.',
       'Keep the same goal. Update assertions to match what actually happens after prior actions.',
       'Do not return assumptions that are not visible or verifiable on the page.',
+      narrativeRepair,
+      'Realign the scenario with this page narrative: prefer the hero, primary CTA, and primary intent; remove or avoid steps that interact with demo or decorative sections unless the original user request explicitly required testing those.',
     ].join('\n');
     emitTelemetry(
       {
@@ -267,6 +285,7 @@ async function saveScenarioDraftWithAutoRepair(
     requestId?: string;
     traceId?: string;
     scenarioId?: string;
+    pageStory?: PageStory | null;
   }
 ): Promise<Scenario> {
   const startValidation = validateStartingWebpage(draftInput.startingWebpage, draftInput.siteUrl);
@@ -286,6 +305,9 @@ async function saveScenarioDraftWithAutoRepair(
     createdAt: new Date().toISOString(),
     lastStatus: 'never',
   };
+  if (context.pageStory !== undefined) {
+    scenario.pageStory = context.pageStory;
+  }
 
   emitTelemetry(
     { eventType: 'scenario_generation_started', scenarioId: scenario.id, mode: context.mode, trace: { intent: context.originalUserMessage } },
@@ -304,6 +326,7 @@ async function saveScenarioDraftWithAutoRepair(
         mode: context.mode,
         requestId: context.requestId,
         traceId: context.traceId,
+        pageStory: context.pageStory,
       }
     );
     scenario.name = verified.name;
@@ -600,6 +623,7 @@ router.post('/scenarios/create-from-prompt', async (req: Request, res: Response)
         originalUserMessage: userMessage.trim(),
         requestId: req.requestId,
         traceId: req.traceId,
+        pageStory: result.pageStory,
       }
     );
     res.json(scenario);
@@ -650,11 +674,17 @@ router.post('/scenarios/:id/modify-before-run', async (req: Request, res: Respon
         mode: 'modify_before_run',
         requestId: req.requestId,
         traceId: req.traceId,
+        pageStory: result.pageStory,
       }
     );
     await repo.updateById(
       scenario.id,
-      { name: verified.name, description: verified.description, steps: verified.steps },
+      {
+        name: verified.name,
+        description: verified.description,
+        steps: verified.steps,
+        pageStory: result.pageStory ?? null,
+      },
       req.owner!
     );
     const updated = await repo.getById(scenario.id, req.owner!)!;
@@ -911,6 +941,265 @@ router.delete('/auth-profiles/:id', async (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
+/** First load only: title, headline, summary — then user picks scenarios vs content check. */
+router.post('/site-preview', async (req: Request, res: Response) => {
+  const { url, headless, authProfileId } = req.body as {
+    url?: string;
+    headless?: boolean;
+    authProfileId?: string;
+  };
+  if (!url) return res.status(400).json({ error: 'url is required' });
+  const headlessOpt = headless !== undefined ? headless : true;
+  try {
+    const result = await previewSite(url, {
+      headless: headlessOpt,
+      authProfileId: authProfileId || undefined,
+      owner: req.owner!,
+    });
+    emitTelemetry(
+      {
+        eventType: 'site_preview_completed',
+        siteUrl: url,
+        resolvedUrl: result.resolvedUrl,
+        headless: headlessOpt,
+        authProfileId: authProfileId ?? null,
+      },
+      'discovery',
+      'info',
+      { requestId: req.requestId, traceId: req.traceId }
+    );
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    emitTelemetry(
+      { eventType: 'site_preview_failed', siteUrl: url, error: redactAuth(msg) },
+      'discovery',
+      'error',
+      { requestId: req.requestId, traceId: req.traceId }
+    );
+    res.status(500).json({ error: redactAuth(msg) });
+  }
+});
+
+/** Persona / copy review crawl + judgment (isolated from discovery). */
+router.post('/content-check', async (req: Request, res: Response) => {
+  if (!isContentCheckEnabled()) {
+    return res.status(503).json({ error: 'Content check is temporarily disabled.' });
+  }
+  const { url, headless, authProfileId, persona, inferPersona, maxExtraPages } = req.body as {
+    url?: string;
+    headless?: boolean;
+    authProfileId?: string;
+    persona?: string;
+    inferPersona?: boolean;
+    maxExtraPages?: number;
+  };
+  if (!url || typeof url !== 'string') return res.status(400).json({ error: 'url is required' });
+  let parsed: URL;
+  try {
+    parsed = new URL(url.trim());
+  } catch {
+    return res.status(400).json({ error: 'Invalid url' });
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    return res.status(400).json({ error: 'url must be http or https' });
+  }
+
+  const headlessOpt = headless !== undefined ? headless : true;
+  const infer = inferPersona === true;
+  let maxExtra = 3;
+  if (typeof maxExtraPages === 'number' && Number.isFinite(maxExtraPages)) {
+    maxExtra = Math.floor(maxExtraPages);
+  }
+  maxExtra = Math.max(0, Math.min(8, maxExtra));
+
+  const contentCheckId = uuidv4();
+  const contentCheckRepo = getContentCheckRepository();
+  const contentCheckCreatedAt = new Date().toISOString();
+  await contentCheckRepo.save(
+    {
+      id: contentCheckId,
+      siteUrl: url.trim(),
+      status: 'running',
+      inputJson: JSON.stringify({
+        headless: headlessOpt,
+        authProfileId: authProfileId ?? null,
+        persona: persona ?? null,
+        inferPersona: infer,
+        maxExtraPages: maxExtra,
+      }),
+      resultJson: null,
+      createdAt: contentCheckCreatedAt,
+      completedAt: null,
+    },
+    req.owner!
+  );
+
+  const started = Date.now();
+  emitTelemetry(
+    {
+      eventType: 'content_check_started',
+      siteUrl: url.trim(),
+      headless: headlessOpt,
+      authProfileId: authProfileId ?? null,
+      inferPersona: infer,
+    },
+    'discovery',
+    'info',
+    { requestId: req.requestId, traceId: req.traceId }
+  );
+
+  try {
+    const result = await runContentCheck(url.trim(), {
+      headless: headlessOpt,
+      authProfileId: authProfileId || undefined,
+      owner: req.owner!,
+      persona: typeof persona === 'string' ? persona : undefined,
+      inferPersona: infer,
+      maxExtraPages: maxExtra,
+      requestId: req.requestId,
+      traceId: req.traceId,
+    });
+    const completedAt = new Date().toISOString();
+    await contentCheckRepo.updateStatus(
+      contentCheckId,
+      req.owner!,
+      'completed',
+      JSON.stringify(result),
+      completedAt
+    );
+    emitTelemetry(
+      {
+        eventType: 'content_check_completed',
+        siteUrl: url.trim(),
+        resolvedHomeUrl: result.resolvedHomeUrl,
+        pageCount: result.pages.length,
+        personaSource: result.personaUsed.source,
+        durationMs: Date.now() - started,
+        crawlErrorCount: result.crawlErrors?.length ?? 0,
+      },
+      'discovery',
+      'info',
+      { requestId: req.requestId, traceId: req.traceId }
+    );
+    res.json({ ...result, contentCheckId, contentCheckPersisted: true });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    await contentCheckRepo.updateStatus(
+      contentCheckId,
+      req.owner!,
+      'failed',
+      JSON.stringify({ error: redactAuth(msg) }),
+      new Date().toISOString()
+    );
+    emitTelemetry(
+      { eventType: 'content_check_failed', siteUrl: url.trim(), error: redactAuth(msg) },
+      'discovery',
+      'error',
+      { requestId: req.requestId, traceId: req.traceId }
+    );
+    res.status(500).json({ error: redactAuth(msg), contentCheckId, contentCheckPersisted: true });
+  }
+});
+
+router.get('/discoveries', async (req: Request, res: Response) => {
+  const siteUrl = typeof req.query.siteUrl === 'string' ? req.query.siteUrl.trim() : undefined;
+  const items = await getDiscoveryRepository().listByOwner(req.owner!, {
+    siteUrl: siteUrl || undefined,
+    limit: 50,
+  });
+  res.json({
+    items: items.map((r) => ({
+      id: r.id,
+      siteUrl: r.siteUrl,
+      status: r.status,
+      createdAt: r.createdAt,
+      completedAt: r.completedAt,
+    })),
+  });
+});
+
+router.get('/discoveries/:id', async (req: Request, res: Response) => {
+  const rec = await getDiscoveryRepository().getById(req.params.id, req.owner!);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+  let result: unknown = null;
+  let resultParseError: string | null = null;
+  if (rec.resultJson) {
+    try {
+      result = JSON.parse(rec.resultJson) as unknown;
+    } catch {
+      resultParseError = 'invalid_json';
+    }
+  }
+  let input: unknown = null;
+  if (rec.inputJson) {
+    try {
+      input = JSON.parse(rec.inputJson) as unknown;
+    } catch {
+      input = null;
+    }
+  }
+  res.json({
+    id: rec.id,
+    siteUrl: rec.siteUrl,
+    status: rec.status,
+    createdAt: rec.createdAt,
+    completedAt: rec.completedAt,
+    input,
+    result,
+    resultParseError,
+  });
+});
+
+router.get('/content-checks', async (req: Request, res: Response) => {
+  const siteUrl = typeof req.query.siteUrl === 'string' ? req.query.siteUrl.trim() : undefined;
+  const items = await getContentCheckRepository().listByOwner(req.owner!, {
+    siteUrl: siteUrl || undefined,
+    limit: 50,
+  });
+  res.json({
+    items: items.map((r) => ({
+      id: r.id,
+      siteUrl: r.siteUrl,
+      status: r.status,
+      createdAt: r.createdAt,
+      completedAt: r.completedAt,
+    })),
+  });
+});
+
+router.get('/content-checks/:id', async (req: Request, res: Response) => {
+  const rec = await getContentCheckRepository().getById(req.params.id, req.owner!);
+  if (!rec) return res.status(404).json({ error: 'Not found' });
+  let result: unknown = null;
+  let resultParseError: string | null = null;
+  if (rec.resultJson) {
+    try {
+      result = JSON.parse(rec.resultJson) as unknown;
+    } catch {
+      resultParseError = 'invalid_json';
+    }
+  }
+  let input: unknown = null;
+  if (rec.inputJson) {
+    try {
+      input = JSON.parse(rec.inputJson) as unknown;
+    } catch {
+      input = null;
+    }
+  }
+  res.json({
+    id: rec.id,
+    siteUrl: rec.siteUrl,
+    status: rec.status,
+    createdAt: rec.createdAt,
+    completedAt: rec.completedAt,
+    input,
+    result,
+    resultParseError,
+  });
+});
+
 router.post('/discover', async (req: Request, res: Response) => {
   const { url, headless, authProfileId } = req.body as {
     url?: string;
@@ -921,6 +1210,21 @@ router.post('/discover', async (req: Request, res: Response) => {
 
   const discoveryId = uuidv4();
   const headlessOpt = headless !== undefined ? headless : true;
+  const discoveryRepo = getDiscoveryRepository();
+  const discoveryCreatedAt = new Date().toISOString();
+  await discoveryRepo.save(
+    {
+      id: discoveryId,
+      siteUrl: typeof url === 'string' ? url.trim() : String(url),
+      status: 'running',
+      inputJson: JSON.stringify({ headless: headlessOpt, authProfileId: authProfileId ?? null }),
+      resultJson: null,
+      createdAt: discoveryCreatedAt,
+      completedAt: null,
+    },
+    req.owner!
+  );
+
   emitTelemetry(
     {
       eventType: 'discovery_started',
@@ -942,6 +1246,13 @@ router.post('/discover', async (req: Request, res: Response) => {
       requestId: req.requestId,
       traceId: req.traceId,
     });
+    await discoveryRepo.updateStatus(
+      discoveryId,
+      req.owner!,
+      'completed',
+      JSON.stringify(result),
+      new Date().toISOString()
+    );
     emitTelemetry(
       {
         eventType: 'discovery_completed',
@@ -961,16 +1272,23 @@ router.post('/discover', async (req: Request, res: Response) => {
       'info',
       { discoveryId, requestId: req.requestId, traceId: req.traceId }
     );
-    res.json(result);
+    res.json({ ...result, discoveryId, discoveryPersisted: true });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    await discoveryRepo.updateStatus(
+      discoveryId,
+      req.owner!,
+      'failed',
+      JSON.stringify({ error: redactAuth(msg) }),
+      new Date().toISOString()
+    );
     emitTelemetry(
       { eventType: 'discovery_failed', siteUrl: url, error: redactAuth(msg) },
       'discovery',
       'error',
       { discoveryId, requestId: req.requestId, traceId: req.traceId }
     );
-    res.status(500).json({ error: redactAuth(msg) });
+    res.status(500).json({ error: redactAuth(msg), discoveryId, discoveryPersisted: true });
   }
 });
 
@@ -978,6 +1296,7 @@ router.post('/scenarios', async (req: Request, res: Response) => {
   const { scenarios } = req.body as { scenarios: ScenarioDraftInput[] };
   if (!scenarios?.length) return res.status(400).json({ error: 'scenarios array required' });
   const saved: Scenario[] = [];
+  const failed: Array<{ scenarioName: string; error: string; scenarioId?: string }> = [];
   for (const s of scenarios) {
     try {
       const scenario = await saveScenarioDraftWithAutoRepair(
@@ -993,10 +1312,26 @@ router.post('/scenarios', async (req: Request, res: Response) => {
       saved.push(scenario);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      return res.status(400).json({ error: msg, scenarioName: s.name });
+      failed.push({
+        scenarioName: s.name,
+        error: msg,
+        ...(err instanceof ScenarioSaveError ? { scenarioId: err.scenarioId } : {}),
+      });
     }
   }
-
+  if (!saved.length) {
+    return res.status(400).json({
+      error: failed[0]?.error || 'Failed to save scenarios',
+      failed,
+    });
+  }
+  if (failed.length) {
+    return res.status(207).json({
+      saved,
+      failed,
+      partial: true,
+    });
+  }
   res.json(saved);
 });
 

@@ -3,6 +3,32 @@
  * Used by services, routes, and persistence layer.
  */
 
+export type { PageStory } from '../services/page-story.js';
+
+/** Structured page summary from discovery extract (matches stagehand DiscoveryPageSummaryRaw). */
+export interface DiscoveryPageSummaryPersisted {
+  url: string;
+  title: string;
+  summary: string;
+  headingSignals: string[];
+  primaryActions: string[];
+  hasMeaningfulForm: boolean;
+  formFields: Array<{
+    label: string;
+    controlKind: 'text' | 'email' | 'textarea' | 'select' | 'other';
+    requiredGuess: boolean;
+    optionLabels?: string[];
+  }>;
+  submitActionLabels: string[];
+}
+
+export interface CrawlPageSnapshot {
+  url: string;
+  source: string;
+  extractedAt: string;
+  raw: DiscoveryPageSummaryPersisted;
+}
+
 export interface Scenario {
   id: string;
   name: string;
@@ -11,6 +37,8 @@ export interface Scenario {
   siteUrl: string;
   /** Discovery/runtime hint: this scenario likely needs signed-in access. */
   requireAuth?: boolean;
+  /** Last extracted page story (create/modify-from-prompt), persisted for reuse. */
+  pageStory?: import('../services/page-story.js').PageStory | null;
   /** Discovery/runtime hint: how reliable this scenario currently is. */
   verificationStatus?: 'verified' | 'repaired' | 'unverified';
   /** Optional reason when verificationStatus is unverified. */
@@ -50,6 +78,17 @@ export interface StepResult {
   durationMs?: number;
 }
 
+/** Lightweight first load of a URL before scenario vs content flow (title, headline, summary). */
+export interface SitePreviewResult {
+  siteUrl: string;
+  resolvedUrl: string;
+  title: string;
+  /** Primary on-page headline when available (else mirrors title). */
+  mainHeadline: string;
+  summary: string;
+  requireAuth: boolean;
+}
+
 export interface DiscoveryResult {
   siteUrl: string;
   /** Full copy/paste log for discovery analysis and debugging. */
@@ -71,7 +110,49 @@ export interface DiscoveryResult {
   targetScenarioCount?: number;
   /** Number of homepage intent candidates extracted before selection. */
   candidateIntentCount?: number;
+  /** Full per-page extract payloads from the crawl (home + journey hops). */
+  crawlPageSnapshots?: CrawlPageSnapshot[];
   scenarios: Omit<Scenario, 'id' | 'createdAt' | 'lastStatus'>[];
+}
+
+/** Persona + copy review for a site (advisory; not a regression gate). */
+export interface ContentCheckPersonaUsed {
+  /** Effective persona description used for judgment. */
+  text: string;
+  source: 'user' | 'inferred';
+  /** 0–1; 1 when user supplied text. */
+  confidence: number;
+}
+
+export interface ContentCheckEvidenceSnippet {
+  /** Short verbatim or tight paraphrase from page copy (from crawl summaries). */
+  quote: string;
+  note?: string;
+}
+
+export interface ContentCheckPageJudgment {
+  url: string;
+  title: string;
+  /** 0–100 advisory scores. */
+  fit: number;
+  clarity: number;
+  trust: number;
+  /** Higher = more friction for the persona. */
+  friction: number;
+  strengths: string[];
+  risks: string[];
+  recommendations: string[];
+  evidenceSnippets: ContentCheckEvidenceSnippet[];
+}
+
+export interface ContentCheckResult {
+  siteUrl: string;
+  resolvedHomeUrl: string;
+  personaUsed: ContentCheckPersonaUsed;
+  /** Cross-page takeaway for the persona. */
+  siteSummary?: string;
+  pages: ContentCheckPageJudgment[];
+  crawlErrors?: string[];
 }
 
 // --- Auth profiles (encrypted at rest) ---
@@ -118,6 +199,14 @@ export type TelemetryActor = 'api' | 'discovery' | 'scenario_build' | 'run';
 
 /** Discovery-flow event payloads */
 export type DiscoveryEventPayload =
+  | {
+      eventType: 'site_preview_completed';
+      siteUrl: string;
+      resolvedUrl: string;
+      headless: boolean;
+      authProfileId?: string | null;
+    }
+  | { eventType: 'site_preview_failed'; siteUrl: string; error: string }
   | { eventType: 'discovery_started'; siteUrl: string; headless: boolean; authProfileId?: string | null }
   | {
       eventType: 'discovery_completed';
@@ -133,7 +222,24 @@ export type DiscoveryEventPayload =
       targetScenarioCount?: number;
       candidateIntentCount?: number;
     }
-  | { eventType: 'discovery_failed'; siteUrl: string; error: string };
+  | { eventType: 'discovery_failed'; siteUrl: string; error: string }
+  | {
+      eventType: 'content_check_started';
+      siteUrl: string;
+      headless: boolean;
+      authProfileId?: string | null;
+      inferPersona: boolean;
+    }
+  | {
+      eventType: 'content_check_completed';
+      siteUrl: string;
+      resolvedHomeUrl: string;
+      pageCount: number;
+      personaSource: 'user' | 'inferred';
+      durationMs: number;
+      crawlErrorCount?: number;
+    }
+  | { eventType: 'content_check_failed'; siteUrl: string; error: string };
 
 /** Scenario build/save flow event payloads */
 export interface ScenarioRepairTrace {

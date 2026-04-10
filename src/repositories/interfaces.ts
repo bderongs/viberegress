@@ -11,6 +11,7 @@ import type {
   AuthProfile,
   AuthProfilePayload,
   AuthProfileMode,
+  PageStory,
 } from '../types/index.js';
 import type { Owner } from '../types/owner.js';
 
@@ -31,6 +32,8 @@ export interface ScenarioRepository {
       steps: Scenario['steps'];
       authProfileId?: string | null;
       startingWebpage?: string | null;
+      /** When set (including null), updates stored page story JSON. */
+      pageStory?: PageStory | null;
     },
     owner: Owner
   ): MaybePromise<void>;
@@ -106,13 +109,44 @@ export interface DiscoveryRecord {
 }
 
 export interface DiscoveryRepository {
-  save(record: DiscoveryRecord): MaybePromise<void>;
-  getById(id: string): MaybePromise<DiscoveryRecord | undefined>;
+  save(record: DiscoveryRecord, owner: Owner): MaybePromise<void>;
+  getById(id: string, owner: Owner): MaybePromise<DiscoveryRecord | undefined>;
+  listByOwner(
+    owner: Owner,
+    options?: { siteUrl?: string; limit?: number }
+  ): MaybePromise<DiscoveryRecord[]>;
   updateStatus(
     id: string,
+    owner: Owner,
     status: DiscoveryRecord['status'],
     resultJson?: string | null,
     completedAt?: string
+  ): MaybePromise<void>;
+}
+
+export interface ContentCheckRecord {
+  id: string;
+  siteUrl: string;
+  status: 'running' | 'completed' | 'failed';
+  inputJson: string | null;
+  resultJson: string | null;
+  createdAt: string;
+  completedAt: string | null;
+}
+
+export interface ContentCheckRepository {
+  save(record: ContentCheckRecord, owner: Owner): MaybePromise<void>;
+  getById(id: string, owner: Owner): MaybePromise<ContentCheckRecord | undefined>;
+  listByOwner(
+    owner: Owner,
+    options?: { siteUrl?: string; limit?: number }
+  ): MaybePromise<ContentCheckRecord[]>;
+  updateStatus(
+    id: string,
+    owner: Owner,
+    status: ContentCheckRecord['status'],
+    resultJson?: string | null,
+    completedAt?: string | undefined
   ): MaybePromise<void>;
 }
 

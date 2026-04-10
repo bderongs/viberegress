@@ -9,7 +9,16 @@ import {
   hasConcreteInputValue,
   normalizeInputInstruction,
 } from './step-quality.js';
-import { DiscoveryResult, Step, AuthProfilePayload, Scenario } from '../types/index.js';
+import {
+  DiscoveryResult,
+  SitePreviewResult,
+  Step,
+  AuthProfilePayload,
+  Scenario,
+  ContentCheckResult,
+  type CrawlPageSnapshot,
+  type DiscoveryPageSummaryPersisted,
+} from '../types/index.js';
 import type { Owner } from '../types/owner.js';
 import { getAuthProfileRepository } from '../repositories/index.js';
 
@@ -18,7 +27,7 @@ const STEP_SNAPSHOT_FILENAME = 'snapshot.jpg';
 const STEP_ACTION_LOG_FILENAME = 'action-log.json';
 const ATOMIC_ACTION_MAX_ATTEMPTS = 2;
 const DISCOVERY_MAX_CLICKS = 5;
-const DISCOVERY_MAX_VISITED_PAGES = 6;
+const DISCOVERY_MAX_VISITED_PAGES = 20;
 // Discovery is allowed to be slower than a single navigation because it can now build
 // multi-act journeys (e.g. pricing -> checkout).
 const DISCOVERY_MAX_MS = 180_000;
@@ -83,6 +92,16 @@ interface JourneyDepthSignals {
   weakReason?: string;
 }
 
+interface DiscoveryObservedState {
+  url: string;
+  title: string;
+  summary: string;
+  headingSignals: string[];
+  primaryActions: string[];
+  hasMeaningfulForm?: boolean;
+  requireAuth?: boolean;
+}
+
 /** Grounded form sketch from discovery page summarization (caps applied in normalizeFormSketch). */
 interface PageFormSketch {
   hasMeaningfulForm: boolean;
@@ -117,6 +136,38 @@ const discoveryPageSummarySchema = z.object({
 });
 
 export type DiscoveryPageSummaryRaw = z.infer<typeof discoveryPageSummarySchema>;
+
+function rawSummaryToPersisted(raw: DiscoveryPageSummaryRaw): DiscoveryPageSummaryPersisted {
+  return {
+    url: raw.url,
+    title: raw.title,
+    summary: raw.summary,
+    headingSignals: raw.headingSignals ?? [],
+    primaryActions: raw.primaryActions ?? [],
+    hasMeaningfulForm: Boolean(raw.hasMeaningfulForm),
+    formFields: (raw.formFields ?? []).map((f) => ({
+      label: f.label,
+      controlKind: f.controlKind,
+      requiredGuess: Boolean(f.requiredGuess),
+      optionLabels: f.optionLabels,
+    })),
+    submitActionLabels: raw.submitActionLabels ?? [],
+  };
+}
+
+function appendCrawlSnapshot(
+  acc: CrawlPageSnapshot[] | undefined,
+  raw: DiscoveryPageSummaryRaw,
+  source: string
+): void {
+  if (!acc) return;
+  acc.push({
+    url: raw.url || '',
+    source,
+    extractedAt: new Date().toISOString(),
+    raw: rawSummaryToPersisted(raw),
+  });
+}
 
 /** Exposed for tests and callers that need normalized discovery form metadata. */
 export function normalizeFormSketch(raw: DiscoveryPageSummaryRaw): PageFormSketch {
@@ -256,6 +307,10 @@ function normalizeList(xs: string[] | undefined): string[] {
   return (xs || []).map((s) => (s || '').trim().toLowerCase()).filter(Boolean);
 }
 
+function shortNormalizedList(xs: string[] | undefined, cap: number): string[] {
+  return normalizeList(xs).slice(0, cap);
+}
+
 function truncateText(value: string, maxLen = 240): string {
   if (!value) return '';
   if (value.length <= maxLen) return value;
@@ -319,6 +374,16 @@ function computeProgressScore(prev: { url: string; headingSignals: string[]; pri
   score += Math.min(25, Math.round(actionsDelta * 25));
   if (newEvidence) score = Math.min(100, score + 10);
   return score;
+}
+
+export function buildDiscoveryStateFingerprint(state: DiscoveryObservedState, baseOrigin?: string): string {
+  const normalizedUrl = normalizeUrlForDiscovery(state.url || '', baseOrigin);
+  const normalizedTitle = (state.title || '').trim().toLowerCase();
+  const headingKey = shortNormalizedList(state.headingSignals, 4).join('|');
+  const actionKey = shortNormalizedList(state.primaryActions, 5).join('|');
+  const formKey = state.hasMeaningfulForm ? 'form:1' : 'form:0';
+  const authKey = state.requireAuth ? 'auth:1' : 'auth:0';
+  return [normalizedUrl, normalizedTitle, headingKey, actionKey, formKey, authKey].join('::');
 }
 
 function isFindBrowseBookIntent(intentLabel: string): boolean {
@@ -579,6 +644,17 @@ function isLikelyDestructiveCta(label: string): boolean {
   return /(logout|log out|delete|remove|terminate|cancel account|close account|unsubscribe|supprimer|déconnexion)/i.test(l);
 }
 
+export function buildIntentSignature(intent: { label: string; actionInstruction: string; sourceSection: string }): string {
+  const label = (intent.label || '').trim().toLowerCase();
+  const action = (intent.actionInstruction || '').trim().toLowerCase();
+  const section = (intent.sourceSection || '').trim().toLowerCase();
+  return [label, action, section].join('::');
+}
+
+function buildIntentOutcomeDedupKey(intent: { label: string; actionInstruction: string; sourceSection: string }, outcomeFingerprint: string): string {
+  return `${buildIntentSignature(intent)}##${outcomeFingerprint || 'unknown'}`;
+}
+
 function buildIntentContract(intent: { label: string; sourceSection: string }): IntentContract {
   const goal = `User intent from CTA "${intent.label}" in ${intent.sourceSection} section. Keep this same intent through the journey.`;
   const expectedEvidenceHints = [intent.label, 'primary destination content', 'next-step CTA aligned with original intent'];
@@ -700,7 +776,10 @@ function hasOutcomeEvidenceFromObserved(observed: {
   const hay = `${observed.title} ${observed.summary} ${(observed.headingSignals || []).join(' ')} ${(observed.primaryActions || []).join(' ')}`.toLowerCase();
   return /(result|results|search|filter|category|categories|listing|catalog|item|session|book|booking|reserve|réserver|trouver|chercher|sélectionner|details|détails|continue|next|start|checkout|payment|pricing|plan)/i.test(
     hay
-  ) || /(thank you|thanks|sent|message sent|success|confirmation|well received|reçu)/i.test(hay);
+  ) || /(thank you|thanks|sent|message sent|success|confirmation|well received|reçu)/i.test(hay) ||
+    /(sign[\s-]?in|log[\s-]?in|sign[\s-]?up|create account|register|auth|connexion|inscription|se connecter|créer mon compte|me connecter|recevoir un lien de connexion)/i.test(
+      hay
+    );
 }
 
 function hasIntentArtifacts(intentLabel: string, observed: { title: string; summary: string; headingSignals: string[]; primaryActions: string[] }): boolean {
@@ -711,13 +790,22 @@ function hasIntentArtifacts(intentLabel: string, observed: { title: string; summ
   return tokens.some((t) => hay.includes(t));
 }
 
-function evaluateJourneyDepth(input: {
+function hasAuthIntent(intentLabel: string): boolean {
+  return /(sign[\s-]?in|log[\s-]?in|sign[\s-]?up|create account|register|auth|connexion|inscription|se connecter|compte)/i.test(
+    intentLabel || ''
+  );
+}
+
+export function evaluateJourneyDepth(input: {
   strictness: DiscoveryStrictness;
   baseUrl: string;
   firstHopUrl: string;
   finalUrl: string;
+  baseFingerprint?: string;
+  firstHopFingerprint?: string;
+  finalFingerprint?: string;
   hopTraces: Array<{ actionInstruction: string }>;
-  finalObserved: { title: string; summary: string; headingSignals: string[]; primaryActions: string[] };
+  finalObserved: { title: string; summary: string; headingSignals: string[]; primaryActions: string[]; requireAuth?: boolean };
   intentLabel: string;
   stallReason?: string;
   intentDrift?: { detected: boolean; reason: string };
@@ -727,10 +815,22 @@ function evaluateJourneyDepth(input: {
   const finalNorm = normalizeUrlForDiscovery(input.finalUrl, new URL(input.baseUrl).origin);
   const meaningfulActCount = input.hopTraces.length;
   const hopCount = input.hopTraces.length;
-  const stateChanged = Boolean(firstNorm && finalNorm && firstNorm !== finalNorm);
-  const samePageLoop = Boolean(finalNorm && baseNorm && finalNorm === baseNorm);
+  const fingerprintChanged = Boolean(
+    input.firstHopFingerprint &&
+      input.finalFingerprint &&
+      input.firstHopFingerprint !== input.finalFingerprint
+  );
+  const stateChanged = Boolean((firstNorm && finalNorm && firstNorm !== finalNorm) || fingerprintChanged);
+  const samePageByUrl = Boolean(finalNorm && baseNorm && finalNorm === baseNorm);
+  const sameFingerprintAsBase = Boolean(
+    input.baseFingerprint && input.finalFingerprint && input.baseFingerprint === input.finalFingerprint
+  );
+  const samePageLoop = samePageByUrl && sameFingerprintAsBase;
   const hasOutcomeEvidence = hasOutcomeEvidenceFromObserved(input.finalObserved);
   const hasIntentEvidence = hasIntentArtifacts(input.intentLabel, input.finalObserved);
+  const authIntent = hasAuthIntent(input.intentLabel);
+  const authDestination = Boolean(input.finalObserved.requireAuth) || isLikelyAuthDestination(input.finalUrl, input.finalObserved.title, input.finalObserved.summary);
+  const authIntentReached = authIntent && authDestination;
   const hasIntentSignal = hasOutcomeEvidence || hasIntentEvidence;
 
   let score = 0;
@@ -738,7 +838,8 @@ function evaluateJourneyDepth(input: {
   score += Math.min(30, meaningfulActCount * 10);
   if (hasOutcomeEvidence) score += 20;
   if (hasIntentEvidence) score += 10;
-  if (samePageLoop) score -= 30;
+  if (authIntentReached) score += 15;
+  if (samePageLoop) score -= authIntentReached ? 10 : 30;
   if (input.stallReason) score -= 20;
   if (input.intentDrift?.detected) score -= 15;
   score = Math.max(0, Math.min(100, score));
@@ -749,7 +850,7 @@ function evaluateJourneyDepth(input: {
     input.stallReason ||
     (input.intentDrift?.detected ? input.intentDrift.reason : undefined) ||
     (samePageLoop && !hasIntentSignal ? 'stalled: journey looped back to start with no outcome evidence' : undefined) ||
-    (needsStateOrEvidence && !stateChanged && !hasIntentSignal ? 'stalled: no state change or outcome evidence' : undefined) ||
+    (needsStateOrEvidence && !stateChanged && !hasIntentSignal && !authIntentReached ? 'stalled: no state change or outcome evidence' : undefined) ||
     (score < minScore ? `stalled: weak journey depth score (${score} < ${minScore})` : undefined);
 
   return {
@@ -880,7 +981,8 @@ async function traceJourneyFromIntent(
   baseUrl: string,
   baseOrigin: string,
   intent: { label: string; actionInstruction: string; priority: number; sourceSection: string },
-  authProfileId?: string | null
+  authProfileId?: string | null,
+  crawlPageSnapshots?: CrawlPageSnapshot[]
 ): Promise<{
   scenarioSteps: Step[];
   requireAuth: boolean;
@@ -915,6 +1017,7 @@ async function traceJourneyFromIntent(
   let stallReason: string | undefined;
   let deepeningAttempted = false;
   const debugEvents: DiscoveryDebugEvent[] = [];
+  let baseStateFingerprint = '';
   let lastObserved: {
     url: string;
     title: string;
@@ -924,6 +1027,7 @@ async function traceJourneyFromIntent(
     headingSignals: string[];
     primaryActions: string[];
     formSketch: PageFormSketch;
+    stateFingerprint: string;
   } | null = null;
 
   const compactContext = () => ({
@@ -1047,6 +1151,12 @@ async function traceJourneyFromIntent(
       throw toTraceError(err, 'summarizeCurrentPage', hopTraces.length);
     }
 
+    appendCrawlSnapshot(
+      crawlPageSnapshots,
+      observed,
+      `intent:${intent.label}:hop_${hopTraces.length}`
+    );
+
     const formSketch = normalizeFormSketch(observed);
     const normUrl = normalizeUrlForDiscovery(observed.url || '', baseOrigin);
     if (!normUrl || !sameSite(normUrl, baseUrl)) {
@@ -1059,6 +1169,18 @@ async function traceJourneyFromIntent(
         headingSignals: observed.headingSignals || [],
         primaryActions: observed.primaryActions || [],
         formSketch,
+        stateFingerprint: buildDiscoveryStateFingerprint(
+          {
+            url: observed.url || normUrl || '',
+            title: observed.title || 'Untitled',
+            summary: observed.summary || '',
+            headingSignals: observed.headingSignals || [],
+            primaryActions: observed.primaryActions || [],
+            hasMeaningfulForm: formSketch.hasMeaningfulForm,
+            requireAuth: false,
+          },
+          baseOrigin
+        ),
       };
     }
 
@@ -1074,6 +1196,18 @@ async function traceJourneyFromIntent(
       headingSignals: observed.headingSignals || [],
       primaryActions: observed.primaryActions || [],
       formSketch,
+      stateFingerprint: buildDiscoveryStateFingerprint(
+        {
+          url: observed.url || normUrl,
+          title: observed.title || 'Untitled',
+          summary: observed.summary || '',
+          headingSignals: observed.headingSignals || [],
+          primaryActions: observed.primaryActions || [],
+          hasMeaningfulForm: formSketch.hasMeaningfulForm,
+          requireAuth,
+        },
+        baseOrigin
+      ),
     };
   };
 
@@ -1085,6 +1219,18 @@ async function traceJourneyFromIntent(
   };
 
   // First hop: perform the CTA act we were given.
+  baseStateFingerprint = buildDiscoveryStateFingerprint(
+    {
+      url: baseUrl,
+      title: 'Home',
+      summary: '',
+      headingSignals: [],
+      primaryActions: [],
+      hasMeaningfulForm: false,
+      requireAuth: false,
+    },
+    baseOrigin
+  );
   steps.push({ instruction: intent.actionInstruction, type: 'act' });
   journeyActCount++;
   usedActionKeys.add((intent.actionInstruction || '').toLowerCase().trim());
@@ -1092,8 +1238,8 @@ async function traceJourneyFromIntent(
   await new Promise((r) => setTimeout(r, DISCOVERY_JOURNEY_SETTLE_MS));
 
   lastObserved = await doSummarize();
-  const firstNormUrl = normalizeUrlForDiscovery(lastObserved.url || '', baseOrigin);
-  if (firstNormUrl) visitedOutcomeKeys.add(firstNormUrl);
+  const firstStateFingerprint = lastObserved.stateFingerprint;
+  if (firstStateFingerprint) visitedOutcomeKeys.add(firstStateFingerprint);
   hopTraces.push({
     actionInstruction: intent.actionInstruction,
     observedOutcome: {
@@ -1245,12 +1391,12 @@ JSON field requirements:
 
     const prevObserved = lastObserved;
     const nextObserved = await doSummarize();
-    const nextNormUrl = normalizeUrlForDiscovery(nextObserved.url || '', baseOrigin);
-    if (nextNormUrl && visitedOutcomeKeys.has(nextNormUrl)) {
+    const nextFingerprint = nextObserved.stateFingerprint;
+    if (nextFingerprint && visitedOutcomeKeys.has(nextFingerprint)) {
       // Loop guard: we've come back to a previously visited URL, stop the journey.
       break;
     }
-    if (nextNormUrl) visitedOutcomeKeys.add(nextNormUrl);
+    if (nextFingerprint) visitedOutcomeKeys.add(nextFingerprint);
     lastObserved = nextObserved;
 
     // Progress gating: if we didn't meaningfully advance, attempt one intent-deepening fallback for find/browse/book intents.
@@ -1378,7 +1524,7 @@ Task:
     };
   }
 
-  const visitedKey = `${normalizeUrlForDiscovery(lastObserved.url || '', baseOrigin)}`;
+  const visitedKey = `${lastObserved.stateFingerprint || normalizeUrlForDiscovery(lastObserved.url || '', baseOrigin)}`;
   const firstHop = hopTraces[0]?.observedOutcome ?? {
     url: lastObserved.url,
     title: lastObserved.title,
@@ -1442,12 +1588,16 @@ Current page context:
     baseUrl,
     firstHopUrl: firstHop.url || baseUrl,
     finalUrl: lastObserved.url || baseUrl,
+    baseFingerprint: baseStateFingerprint,
+    firstHopFingerprint: firstStateFingerprint,
+    finalFingerprint: lastObserved.stateFingerprint,
     hopTraces,
     finalObserved: {
       title: lastObserved.title,
       summary: lastObserved.summary,
       headingSignals: lastObserved.headingSignals,
       primaryActions: lastObserved.primaryActions,
+      requireAuth: lastObserved.requireAuth,
     },
     intentLabel: intent.label,
     stallReason,
@@ -1546,6 +1696,8 @@ function buildDiscoveryLogText(input: {
   siteUrl: string;
   visitedPages: DiscoveryVisitedPage[];
   selectedCtas: string[];
+  candidateIntents: Array<{ label: string; actionInstruction: string; priority: number; sourceSection: string }>;
+  tracedIntents: Array<{ label: string; actionInstruction: string; priority: number; sourceSection: string }>;
   crawlErrors: string[];
   intentLogs: DiscoveryIntentLog[];
   failureDigest?: DiscoveryFailureDigestEntry[];
@@ -1586,6 +1738,44 @@ function buildDiscoveryLogText(input: {
   sections.push('');
   sections.push(`SELECTED CTAS`);
   sections.push(input.selectedCtas.length ? input.selectedCtas.map((c, i) => `${i + 1}. ${c}`).join('\n') : '- none');
+  sections.push('');
+  sections.push(`CANDIDATE INTENTS (EXTRACTED)`);
+  sections.push(
+    input.candidateIntents.length
+      ? input.candidateIntents
+          .map(
+            (it, i) =>
+              `${i + 1}. label: ${it.label}\n   actionInstruction: ${it.actionInstruction}\n   priority: ${it.priority}\n   sourceSection: ${it.sourceSection}`
+          )
+          .join('\n')
+      : '- none'
+  );
+  sections.push('');
+  sections.push(`TRACED INTENTS (TOP TARGET SLICE)`);
+  sections.push(
+    input.tracedIntents.length
+      ? input.tracedIntents
+          .map(
+            (it, i) =>
+              `${i + 1}. label: ${it.label}\n   actionInstruction: ${it.actionInstruction}\n   priority: ${it.priority}\n   sourceSection: ${it.sourceSection}`
+          )
+          .join('\n')
+      : '- none'
+  );
+  sections.push('');
+  sections.push(`UNTRACED CANDIDATES`);
+  const tracedKeys = new Set(input.tracedIntents.map((it) => `${it.label}::${it.actionInstruction}`));
+  const untraced = input.candidateIntents.filter((it) => !tracedKeys.has(`${it.label}::${it.actionInstruction}`));
+  sections.push(
+    untraced.length
+      ? untraced
+          .map(
+            (it, i) =>
+              `${i + 1}. label: ${it.label}\n   actionInstruction: ${it.actionInstruction}\n   priority: ${it.priority}\n   sourceSection: ${it.sourceSection}\n   reason: outside targetScenarioCount slice`
+          )
+          .join('\n')
+      : '- none'
+  );
   sections.push('');
   sections.push(`VISITED PAGES`);
   sections.push(
@@ -1665,6 +1855,360 @@ function buildDiscoveryLogText(input: {
   return sections.join('\n');
 }
 
+/**
+ * Open the URL once and extract title, main headline, and short summary for the welcome “confirm site” step.
+ * Does not run scenario discovery or content analysis.
+ */
+export async function previewSite(
+  siteUrl: string,
+  options?: { headless?: boolean; authProfileId?: string; owner?: Owner }
+): Promise<SitePreviewResult> {
+  const headless = options?.headless ?? true;
+  let authPayload: AuthProfilePayload | undefined;
+  if (options?.authProfileId) {
+    if (!options?.owner) throw new Error('owner required when using auth profile');
+    const withPayload = await getAuthProfileRepository().getByIdWithPayload(options.authProfileId, options.owner);
+    if (!withPayload) throw new Error('Auth profile not found: ' + options.authProfileId);
+    authPayload = withPayload.payload;
+  }
+
+  const stagehand = new Stagehand({
+    env: 'LOCAL',
+    verbose: 1,
+    localBrowserLaunchOptions: buildLaunchOptions(headless, authPayload) as LocalBrowserLaunchOptions,
+  });
+  await stagehand.init();
+  const page = stagehand.page;
+
+  try {
+    await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const raw = await summarizeCurrentPage(page as unknown as {
+      extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
+    });
+    const resolvedUrl = raw.url || siteUrl;
+    const title = raw.title || '';
+    const mainHeadline =
+      raw.headingSignals && raw.headingSignals.length > 0 && String(raw.headingSignals[0]).trim()
+        ? String(raw.headingSignals[0]).trim()
+        : title;
+    return {
+      siteUrl,
+      resolvedUrl,
+      title,
+      mainHeadline,
+      summary: raw.summary || '',
+      requireAuth: isLikelyAuthDestination(resolvedUrl, title, raw.summary || ''),
+    };
+  } finally {
+    await stagehand.close();
+  }
+}
+
+const CONTENT_CHECK_MAX_MS = 90_000;
+const CONTENT_CHECK_DEFAULT_EXTRA_PAGES = 3;
+const CONTENT_CHECK_MAX_EXTRA_PAGES_CAP = 8;
+
+const DEFAULT_CONTENT_PERSONA =
+  'A general web visitor evaluating whether the site is clear, trustworthy, and easy to act on.';
+
+function isLikelyAuthPathOnly(urlStr: string): boolean {
+  try {
+    const p = new URL(urlStr).pathname.toLowerCase();
+    return /(^|\/)(sign[_-]?in|log[_-]?in|sign[_-]?up|register|login|signup|auth)(\/|$)/i.test(p);
+  } catch {
+    return false;
+  }
+}
+
+function clampScore100(n: number): number {
+  if (Number.isNaN(n)) return 50;
+  return Math.round(Math.max(0, Math.min(100, n)));
+}
+
+function truncateForPrompt(s: string, maxLen: number): string {
+  const t = (s || '').trim();
+  if (t.length <= maxLen) return t;
+  return `${t.slice(0, maxLen - 3)}...`;
+}
+
+function contentPageKey(url: string): string {
+  try {
+    const u = new URL(url);
+    u.hash = '';
+    let p = u.pathname;
+    if (p.length > 1 && p.endsWith('/')) p = p.slice(0, -1);
+    const h = u.hostname.replace(/^www\./i, '').toLowerCase();
+    return `${u.protocol}//${h}${p}${u.search}`;
+  } catch {
+    return url;
+  }
+}
+
+const contentCheckPageJudgmentSchema = z.object({
+  url: z.string(),
+  title: z.string(),
+  fit: z.number(),
+  clarity: z.number(),
+  trust: z.number(),
+  friction: z.number(),
+  strengths: z.array(z.string()),
+  risks: z.array(z.string()),
+  recommendations: z.array(z.string()),
+  evidenceSnippets: z.array(
+    z.object({
+      quote: z.string(),
+      note: z.string().optional(),
+    })
+  ),
+});
+
+const contentCheckJudgmentExtractSchema = z.object({
+  siteSummary: z.string().optional(),
+  pages: z.array(contentCheckPageJudgmentSchema),
+});
+
+async function collectSameOriginLinks(
+  page: { evaluate: (fn: (origin: string) => unknown, arg: string) => Promise<unknown> },
+  pageOrigin: string
+): Promise<Array<{ url: string; fromNav: boolean }>> {
+  const result = await page.evaluate((origin: string) => {
+    const sel = 'header a[href], nav a[href], [role="navigation"] a[href], main a[href]';
+    const nodes = document.querySelectorAll(sel);
+    const rows: { url: string; fromNav: boolean }[] = [];
+    const seen = new Set<string>();
+    const base = new URL(origin);
+    const baseHost = base.hostname.replace(/^www\./i, '').toLowerCase();
+    for (const a of Array.from(nodes)) {
+      const el = a as Element;
+      const href = el.getAttribute('href');
+      if (!href || href.startsWith('#') || href.toLowerCase().startsWith('javascript:')) continue;
+      try {
+        const u = new URL(href, origin);
+        if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
+        const h = u.hostname.replace(/^www\./i, '').toLowerCase();
+        if (h !== baseHost) continue;
+        u.hash = '';
+        const path = u.pathname.toLowerCase();
+        if (/\.(pdf|zip|jpe?g|png|gif|svg|ico|webp|woff2?|mp4)(\?|$)/i.test(path)) continue;
+        const key = u.href;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const fromNav = !!el.closest('nav,[role="navigation"],header');
+        rows.push({ url: u.href, fromNav });
+      } catch {
+        /* skip */
+      }
+    }
+    return rows;
+  }, pageOrigin);
+  return result as Array<{ url: string; fromNav: boolean }>;
+}
+
+/**
+ * Persona-oriented copy/UX review: homepage + capped same-origin pages, then one structured judgment pass.
+ * Advisory only; does not affect scenario discovery.
+ */
+export async function runContentCheck(
+  siteUrl: string,
+  options?: {
+    headless?: boolean;
+    authProfileId?: string;
+    owner?: Owner;
+    persona?: string;
+    inferPersona?: boolean;
+    maxExtraPages?: number;
+    requestId?: string;
+    traceId?: string;
+  }
+): Promise<ContentCheckResult> {
+  const deadline = Date.now() + CONTENT_CHECK_MAX_MS;
+  const withinBudget = () => Date.now() < deadline;
+
+  const headless = options?.headless ?? true;
+  let authPayload: AuthProfilePayload | undefined;
+  if (options?.authProfileId) {
+    if (!options?.owner) throw new Error('owner required when using auth profile');
+    const withPayload = await getAuthProfileRepository().getByIdWithPayload(options.authProfileId, options.owner);
+    if (!withPayload) throw new Error('Auth profile not found: ' + options.authProfileId);
+    authPayload = withPayload.payload;
+  }
+
+  const maxExtra = Math.min(
+    CONTENT_CHECK_MAX_EXTRA_PAGES_CAP,
+    Math.max(0, options?.maxExtraPages ?? CONTENT_CHECK_DEFAULT_EXTRA_PAGES)
+  );
+
+  const stagehand = new Stagehand({
+    env: 'LOCAL',
+    verbose: 1,
+    localBrowserLaunchOptions: buildLaunchOptions(headless, authPayload) as LocalBrowserLaunchOptions,
+  });
+  await stagehand.init();
+  const page = stagehand.page;
+
+  const crawlErrors: string[] = [];
+  type Snap = { url: string; summary: DiscoveryPageSummaryRaw; requireAuth: boolean };
+  const snapshots: Snap[] = [];
+
+  const pwPage = page as unknown as {
+    extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<unknown>;
+    goto: (url: string, opts?: { waitUntil?: 'domcontentloaded'; timeout?: number }) => Promise<unknown>;
+    evaluate: (fn: (origin: string) => unknown, arg: string) => Promise<unknown>;
+  };
+  const summarizeHost = pwPage as Parameters<typeof summarizeCurrentPage>[0];
+
+  try {
+    await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    let homeRaw = await summarizeCurrentPage(summarizeHost);
+    const resolvedHomeUrl = homeRaw.url || siteUrl;
+    const baseOrigin = new URL(resolvedHomeUrl).origin;
+    const homeKey = contentPageKey(resolvedHomeUrl);
+
+    snapshots.push({
+      url: resolvedHomeUrl,
+      summary: homeRaw,
+      requireAuth: isLikelyAuthDestination(resolvedHomeUrl, homeRaw.title || '', homeRaw.summary || ''),
+    });
+
+    let personaUsed: ContentCheckResult['personaUsed'];
+    const personaTrim = (options?.persona || '').trim();
+
+    if (personaTrim) {
+      personaUsed = { text: personaTrim, source: 'user', confidence: 1 };
+    } else if (options?.inferPersona) {
+      try {
+        const inferred = (await pwPage.extract({
+          instruction: `From this page's visible positioning only, infer ONE short primary user persona (role + goal in one or two sentences) who this homepage most clearly targets. If unclear, say so. Return confidence 0-1.`,
+          schema: z.object({
+            personaDescription: z.string(),
+            confidence: z.number(),
+          }),
+          iframes: true,
+        })) as { personaDescription: string; confidence: number };
+        const text = (inferred.personaDescription || '').trim() || DEFAULT_CONTENT_PERSONA;
+        const conf =
+          typeof inferred.confidence === 'number' && inferred.confidence >= 0 && inferred.confidence <= 1
+            ? inferred.confidence
+            : 0.5;
+        personaUsed = { text, source: 'inferred', confidence: conf };
+      } catch (err) {
+        crawlErrors.push(`persona_infer_failed: ${err instanceof Error ? err.message : String(err)}`);
+        personaUsed = { text: DEFAULT_CONTENT_PERSONA, source: 'inferred', confidence: 0.35 };
+      }
+    } else {
+      // No user text and inference off: neutral default (explicit low confidence).
+      personaUsed = { text: DEFAULT_CONTENT_PERSONA, source: 'inferred', confidence: 0.35 };
+    }
+
+    if (withinBudget() && maxExtra > 0) {
+      let candidates: Array<{ url: string; fromNav: boolean }> = [];
+      try {
+        candidates = await collectSameOriginLinks(pwPage, baseOrigin);
+      } catch (err) {
+        crawlErrors.push(`link_collect_failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      candidates.sort((a, b) => (a.fromNav === b.fromNav ? 0 : a.fromNav ? -1 : 1));
+
+      const seenKeys = new Set<string>([homeKey]);
+      const toVisit: string[] = [];
+      for (const c of candidates) {
+        if (toVisit.length >= maxExtra) break;
+        const k = contentPageKey(c.url);
+        if (seenKeys.has(k)) continue;
+        if (isLikelyAuthPathOnly(c.url)) continue;
+        seenKeys.add(k);
+        toVisit.push(c.url);
+      }
+
+      for (const u of toVisit) {
+        if (!withinBudget()) {
+          crawlErrors.push('time_budget: skipped remaining extra pages');
+          break;
+        }
+        try {
+          await page.goto(u, { waitUntil: 'domcontentloaded', timeout: 30000 });
+          const raw = await summarizeCurrentPage(summarizeHost);
+          const finalUrl = raw.url || u;
+          snapshots.push({
+            url: finalUrl,
+            summary: raw,
+            requireAuth: isLikelyAuthDestination(finalUrl, raw.title || '', raw.summary || ''),
+          });
+        } catch (err) {
+          crawlErrors.push(`nav_fail ${u}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    }
+
+    if (!withinBudget()) {
+      crawlErrors.push('time_budget: judgment may be partial');
+    }
+
+    await page.goto(resolvedHomeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+
+    const packLines: string[] = [];
+    for (let i = 0; i < snapshots.length; i++) {
+      const s = snapshots[i];
+      const r = s.summary;
+      packLines.push(`--- PAGE ${i + 1} ---`);
+      packLines.push(`url: ${s.url}`);
+      packLines.push(`title: ${truncateForPrompt(r.title || '', 200)}`);
+      packLines.push(`summary: ${truncateForPrompt(r.summary || '', 900)}`);
+      packLines.push(`headings: ${(r.headingSignals || []).slice(0, 5).join(' | ')}`);
+      packLines.push(`primaryActions: ${(r.primaryActions || []).slice(0, 6).join(' | ')}`);
+      packLines.push(`likelyAuthHeuristic: ${s.requireAuth ? 'yes' : 'no'}`);
+    }
+    const pack = packLines.join('\n');
+
+    const judgeInstruction = `You are reviewing website copy and UX for an ADVISORY persona fit report (not pass/fail QA).
+
+Persona:
+${personaUsed.text}
+
+Crawled page facts (only use these; do not invent pages or quotes):
+${pack}
+
+Return JSON matching the schema:
+- siteSummary: optional 2-4 sentences across all pages for this persona.
+- pages: one object per PAGE in order above, with the EXACT same url string as in the crawl.
+For each page: title, fit/clarity/trust/friction as integers 0-100 (friction = higher means harder/confusing for the persona), strengths/risks/recommendations as short bullet strings, evidenceSnippets with quote text copied or tightly paraphrased ONLY from the summaries/headings/actions above (each quote must be attributable to that page's block).`;
+
+    const judged = (await pwPage.extract({
+      instruction: judgeInstruction,
+      schema: contentCheckJudgmentExtractSchema,
+      iframes: true,
+    })) as z.infer<typeof contentCheckJudgmentExtractSchema>;
+
+    const pagesOut: ContentCheckResult['pages'] = (judged.pages || []).map((p) => ({
+      url: p.url,
+      title: p.title,
+      fit: clampScore100(p.fit),
+      clarity: clampScore100(p.clarity),
+      trust: clampScore100(p.trust),
+      friction: clampScore100(p.friction),
+      strengths: (p.strengths || []).map((s) => String(s).trim()).filter(Boolean),
+      risks: (p.risks || []).map((s) => String(s).trim()).filter(Boolean),
+      recommendations: (p.recommendations || []).map((s) => String(s).trim()).filter(Boolean),
+      evidenceSnippets: (p.evidenceSnippets || []).map((e) => ({
+        quote: String(e.quote || '').trim(),
+        note: e.note ? String(e.note).trim() : undefined,
+      })),
+    }));
+
+    return {
+      siteUrl,
+      resolvedHomeUrl,
+      personaUsed,
+      siteSummary: judged.siteSummary?.trim() || undefined,
+      pages: pagesOut,
+      crawlErrors: crawlErrors.length ? crawlErrors : undefined,
+    };
+  } finally {
+    await stagehand.close();
+  }
+}
+
 export async function discoverScenarios(
   siteUrl: string,
   options?: { headless?: boolean; authProfileId?: string; owner?: Owner; requestId?: string; traceId?: string; discoveryId?: string }
@@ -1697,12 +2241,14 @@ export async function discoverScenarios(
     const crawlErrors: string[] = [];
     const intentLogs: DiscoveryIntentLog[] = [];
     const failureDigestAccumulator = new Map<string, { stepKey: string; errorClass: string; count: number; intents: Set<string> }>();
-    const seenOutcomeKeys = new Set<string>();
+    const seenIntentOutcomeKeys = new Set<string>();
     const crawlStart = Date.now();
+    const crawlPageSnapshots: CrawlPageSnapshot[] = [];
 
     const home = await summarizeCurrentPage(page as unknown as {
       extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
     });
+    appendCrawlSnapshot(crawlPageSnapshots, home, 'home');
     visitedPages.push({
       url: home.url || baseUrl,
       title: home.title || 'Home',
@@ -1740,11 +2286,13 @@ export async function discoverScenarios(
           baseUrl,
           baseOrigin,
           intent,
-          options?.authProfileId
+          options?.authProfileId,
+          crawlPageSnapshots
         );
 
         const outcomeKey = trace.visitedOutcomeKey;
-        if (!outcomeKey || seenOutcomeKeys.has(outcomeKey)) {
+        const dedupeKey = buildIntentOutcomeDedupKey(intent, outcomeKey);
+        if (!outcomeKey || seenIntentOutcomeKeys.has(dedupeKey)) {
           intentLogs.push({
             label: intent.label,
             actionInstruction: intent.actionInstruction,
@@ -1766,7 +2314,7 @@ export async function discoverScenarios(
           });
           continue;
         }
-        seenOutcomeKeys.add(outcomeKey);
+        seenIntentOutcomeKeys.add(dedupeKey);
 
         selectedCtas.push(intent.label);
 
@@ -2110,6 +2658,8 @@ export async function discoverScenarios(
       siteUrl,
       visitedPages,
       selectedCtas,
+      candidateIntents: intents ?? [],
+      tracedIntents: selectedIntents ?? [],
       crawlErrors: crawlErrorsWithSummary,
       intentLogs,
       failureDigest,
@@ -2127,6 +2677,7 @@ export async function discoverScenarios(
       },
       targetScenarioCount,
       candidateIntentCount,
+      crawlPageSnapshots,
       scenarios: finalScenarios,
     };
   } finally {

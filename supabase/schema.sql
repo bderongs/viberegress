@@ -13,11 +13,12 @@ CREATE TABLE IF NOT EXISTS public.scenarios (
   last_status text CHECK (last_status IN ('pass', 'fail', 'never')),
   auth_profile_id text,
   starting_webpage text,
+  page_story_json text,
   owner_type text NOT NULL CHECK (owner_type IN ('anonymous', 'user')),
   owner_id text NOT NULL
 );
 
--- Discoveries
+-- Discoveries (crawl + scenario discovery results; scoped per owner)
 CREATE TABLE IF NOT EXISTS public.discoveries (
   id text PRIMARY KEY,
   site_url text NOT NULL,
@@ -25,7 +26,22 @@ CREATE TABLE IF NOT EXISTS public.discoveries (
   input_json text,
   result_json text,
   created_at text NOT NULL,
-  completed_at text
+  completed_at text,
+  owner_type text NOT NULL CHECK (owner_type IN ('anonymous', 'user')),
+  owner_id text NOT NULL
+);
+
+-- Content check runs (persona / copy review crawl)
+CREATE TABLE IF NOT EXISTS public.content_checks (
+  id text PRIMARY KEY,
+  site_url text NOT NULL,
+  status text NOT NULL CHECK (status IN ('running', 'completed', 'failed')),
+  input_json text,
+  result_json text,
+  created_at text NOT NULL,
+  completed_at text,
+  owner_type text NOT NULL CHECK (owner_type IN ('anonymous', 'user')),
+  owner_id text NOT NULL
 );
 
 -- Auth profiles
@@ -119,6 +135,21 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_events_discovery_id ON public.telemetry
 CREATE INDEX IF NOT EXISTS idx_telemetry_events_occurred_at ON public.telemetry_events(occurred_at);
 CREATE INDEX IF NOT EXISTS idx_run_artifacts_run_id ON public.run_artifacts(run_id);
 CREATE INDEX IF NOT EXISTS idx_scenario_versions_run_id ON public.scenario_versions(run_id);
+
+-- Existing DBs may have an old `discoveries` row without owner columns: add columns
+-- BEFORE creating indexes that reference them. Prefer `supabase/migrations/*.sql` for upgrades.
+ALTER TABLE public.scenarios ADD COLUMN IF NOT EXISTS page_story_json text;
+ALTER TABLE public.discoveries ADD COLUMN IF NOT EXISTS owner_type text;
+ALTER TABLE public.discoveries ADD COLUMN IF NOT EXISTS owner_id text;
+UPDATE public.discoveries SET owner_type = 'anonymous' WHERE owner_type IS NULL OR trim(owner_type) = '';
+UPDATE public.discoveries SET owner_id = 'legacy' WHERE owner_id IS NULL OR trim(owner_id) = '';
+ALTER TABLE public.discoveries ALTER COLUMN owner_type SET DEFAULT 'anonymous';
+ALTER TABLE public.discoveries ALTER COLUMN owner_id SET DEFAULT 'legacy';
+ALTER TABLE public.discoveries ALTER COLUMN owner_type SET NOT NULL;
+ALTER TABLE public.discoveries ALTER COLUMN owner_id SET NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_discoveries_owner_created ON public.discoveries(owner_type, owner_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_content_checks_owner_created ON public.content_checks(owner_type, owner_id, created_at DESC);
 
 -- Magic links: public read-only access to a site workspace (scenarios)
 CREATE TABLE IF NOT EXISTS public.site_share_links (

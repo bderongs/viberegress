@@ -2,7 +2,7 @@
  * Postgres implementation of ScenarioRepository.
  */
 
-import type { Scenario, Step } from '../types/index.js';
+import type { Scenario, Step, PageStory } from '../types/index.js';
 import type { Owner } from '../types/owner.js';
 import type { ScenarioRepository } from './interfaces.js';
 import { getPgPool } from '../lib/postgres.js';
@@ -31,9 +31,18 @@ interface Row {
   last_run_at: string | null;
   last_status: string | null;
   auth_profile_id: string | null;
+  page_story_json: string | null;
 }
 
 function rowToScenario(row: Row): Scenario {
+  let pageStory: Scenario['pageStory'];
+  if (row.page_story_json?.trim()) {
+    try {
+      pageStory = JSON.parse(row.page_story_json) as Scenario['pageStory'];
+    } catch {
+      pageStory = undefined;
+    }
+  }
   return {
     id: row.id,
     name: row.name,
@@ -45,7 +54,13 @@ function rowToScenario(row: Row): Scenario {
     lastRunAt: row.last_run_at ?? undefined,
     lastStatus: (row.last_status as Scenario['lastStatus']) ?? undefined,
     authProfileId: row.auth_profile_id ?? undefined,
+    ...(pageStory !== undefined ? { pageStory } : {}),
   };
+}
+
+function pageStoryDbValue(scenario: Scenario): string | null {
+  if (scenario.pageStory === undefined || scenario.pageStory === null) return null;
+  return JSON.stringify(scenario.pageStory);
 }
 
 export function createScenarioRepository(): ScenarioRepository {
@@ -57,8 +72,8 @@ export function createScenarioRepository(): ScenarioRepository {
       await pool.query(
         `INSERT INTO scenarios (
           id, name, description, site_url, steps_json, created_at, last_run_at, last_status,
-          auth_profile_id, starting_webpage, owner_type, owner_id
-        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          auth_profile_id, starting_webpage, page_story_json, owner_type, owner_id
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (id) DO UPDATE SET
           name = EXCLUDED.name,
           description = EXCLUDED.description,
@@ -69,6 +84,7 @@ export function createScenarioRepository(): ScenarioRepository {
           last_status = EXCLUDED.last_status,
           auth_profile_id = EXCLUDED.auth_profile_id,
           starting_webpage = EXCLUDED.starting_webpage,
+          page_story_json = EXCLUDED.page_story_json,
           owner_type = EXCLUDED.owner_type,
           owner_id = EXCLUDED.owner_id`,
         [
@@ -82,6 +98,7 @@ export function createScenarioRepository(): ScenarioRepository {
           scenario.lastStatus ?? null,
           scenario.authProfileId ?? null,
           scenario.startingWebpage ?? null,
+          pageStoryDbValue(scenario),
           ownerType,
           ownerId,
         ]
@@ -136,12 +153,17 @@ export function createScenarioRepository(): ScenarioRepository {
         steps: Step[];
         authProfileId?: string | null;
         startingWebpage?: string | null;
+        pageStory?: PageStory | null;
       },
       owner: Owner
     ): Promise<void> {
       const { ownerType, ownerId } = ownerDb(owner);
-      const existingResult = await pool.query<{ auth_profile_id: string | null; starting_webpage: string | null }>(
-        `SELECT auth_profile_id, starting_webpage
+      const existingResult = await pool.query<{
+        auth_profile_id: string | null;
+        starting_webpage: string | null;
+        page_story_json: string | null;
+      }>(
+        `SELECT auth_profile_id, starting_webpage, page_story_json
          FROM scenarios
          WHERE id = $1 AND owner_type = $2 AND owner_id = $3`,
         [id, ownerType, ownerId]
@@ -151,11 +173,25 @@ export function createScenarioRepository(): ScenarioRepository {
       const authProfileId = data.authProfileId !== undefined ? data.authProfileId : existing.auth_profile_id ?? null;
       const startingWebpage =
         data.startingWebpage !== undefined ? data.startingWebpage : existing.starting_webpage ?? null;
+      let pageStoryJson = existing.page_story_json;
+      if (data.pageStory !== undefined) {
+        pageStoryJson = data.pageStory ? JSON.stringify(data.pageStory) : null;
+      }
       await pool.query(
         `UPDATE scenarios
-         SET name = $1, description = $2, steps_json = $3, auth_profile_id = $4, starting_webpage = $5
-         WHERE id = $6 AND owner_type = $7 AND owner_id = $8`,
-        [data.name, data.description, serializeSteps(data.steps), authProfileId, startingWebpage, id, ownerType, ownerId]
+         SET name = $1, description = $2, steps_json = $3, auth_profile_id = $4, starting_webpage = $5, page_story_json = $6
+         WHERE id = $7 AND owner_type = $8 AND owner_id = $9`,
+        [
+          data.name,
+          data.description,
+          serializeSteps(data.steps),
+          authProfileId,
+          startingWebpage,
+          pageStoryJson,
+          id,
+          ownerType,
+          ownerId,
+        ]
       );
     },
 

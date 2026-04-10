@@ -7,6 +7,7 @@ import { createRunRepository as createRunRepositoryPg, createRunStepRepository a
 import { createTelemetryEventRepository as createTelemetryEventRepositoryPg } from './postgres-telemetry.js';
 import { createArtifactRepository as createArtifactRepositoryPg } from './postgres-artifact.js';
 import { createDiscoveryRepository as createDiscoveryRepositoryPg } from './postgres-discovery.js';
+import { createContentCheckRepository as createContentCheckRepositoryPg } from './postgres-content-check.js';
 import { createScenarioVersionRepository as createScenarioVersionRepositoryPg } from './postgres-scenario-version.js';
 import { createAuthProfileRepository as createAuthProfileRepositoryPg } from './postgres-auth-profile.js';
 import { createSiteShareLinkRepository as createSiteShareLinkRepositoryPg } from './postgres-site-share.js';
@@ -16,6 +17,7 @@ import type {
   TelemetryEventRepository,
   ArtifactRepository,
   DiscoveryRepository,
+  ContentCheckRepository,
   ScenarioVersionRepository,
   RunStepRepository,
   AuthProfileRepository,
@@ -28,6 +30,7 @@ let runStepRepo: RunStepRepository | null = null;
 let telemetryRepo: TelemetryEventRepository | null = null;
 let artifactRepo: ArtifactRepository | null = null;
 let discoveryRepo: DiscoveryRepository | null = null;
+let contentCheckRepo: ContentCheckRepository | null = null;
 let scenarioVersionRepo: ScenarioVersionRepository | null = null;
 let authProfileRepo: AuthProfileRepository | null = null;
 let siteShareLinkRepo: SiteShareLinkRepository | null = null;
@@ -62,6 +65,11 @@ export function getDiscoveryRepository(): DiscoveryRepository {
   return discoveryRepo;
 }
 
+export function getContentCheckRepository(): ContentCheckRepository {
+  if (!contentCheckRepo) contentCheckRepo = createContentCheckRepositoryPg();
+  return contentCheckRepo;
+}
+
 export function getScenarioVersionRepository(): ScenarioVersionRepository {
   if (!scenarioVersionRepo) scenarioVersionRepo = createScenarioVersionRepositoryPg();
   return scenarioVersionRepo;
@@ -83,9 +91,16 @@ export type {
   TelemetryEventRepository,
   ArtifactRepository,
   DiscoveryRepository,
+  ContentCheckRepository,
   ScenarioVersionRepository,
   RunStepRepository,
   AuthProfileRepository,
   SiteShareLinkRepository,
 };
-export type { RunArtifactRecord, DiscoveryRecord, ScenarioVersionRecord, RunStepRecord } from './interfaces.js';
+export type {
+  RunArtifactRecord,
+  DiscoveryRecord,
+  ContentCheckRecord,
+  ScenarioVersionRecord,
+  RunStepRecord,
+} from './interfaces.js';

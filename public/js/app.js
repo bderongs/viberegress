@@ -1,6 +1,41 @@
 // ─── State ───────────────────────────────────────────────────────────
 const SESSION_KEY = 'viberegress_session_id';
 const TRIAL_RUNS_KEY = 'viberegress_trial_runs_used';
+/** Local preference: show generation logs, discovery full log, visited pages. */
+const ADVANCED_VIEW_KEY = 'viberegress_advanced_view';
+
+function isAdvancedView() {
+  try {
+    return localStorage.getItem(ADVANCED_VIEW_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
+function setAdvancedView(enabled) {
+  try {
+    if (enabled) localStorage.setItem(ADVANCED_VIEW_KEY, '1');
+    else localStorage.removeItem(ADVANCED_VIEW_KEY);
+  } catch (_) {}
+  applyAdvancedViewPreference();
+}
+
+/** Apply advanced-view visibility (generation logs panel, discovery diagnostics). Call after DOM ready and when toggling preference. */
+function applyAdvancedViewPreference() {
+  const on = isAdvancedView();
+  const genPanel = $('panel-scenario-generation-logs');
+  /** Use boolean `hidden` — `.panel.hidden` has no CSS in this app, so a class alone did not hide the panel. */
+  if (genPanel) genPanel.hidden = !on;
+  if (discoveredScenarios) renderDiscovery(discoveredScenarios);
+  renderSiteExploreSection();
+  if (activeScenarioId) {
+    if (on) void loadScenarioBuildLogs(activeScenarioId);
+    else {
+      const c = $('scenario-build-logs');
+      if (c) c.innerHTML = '<p class="run-idle">No generation logs yet.</p>';
+    }
+  }
+}
 
 let scenarios = [];
 let activeScenarioId = null;
@@ -50,6 +85,7 @@ const $ = id => document.getElementById(id);
 const views = {
   welcome:        $('view-welcome'),
   discovery:      $('view-discovery'),
+  contentCheck:   $('view-content-check'),
   scenario:       $('view-scenario'),
   authProfiles:   $('view-auth-profiles'),
   site:           $('view-site'),
@@ -58,14 +94,645 @@ const views = {
   sharedScenario: $('view-shared-scenario'),
 };
 
+/** Last `/site-preview` result for the welcome “choose next step” flow. */
+let sitePreviewResult = null;
+/** Last `/content-check` result for the Check content view (also persisted per site). */
+let contentCheckResult = null;
+/** Where Check content returns when using Back (`welcome` scan flow vs `site` dashboard). */
+let contentCheckBackTarget = 'welcome';
+
+/** Normalized site id for sidebar + localStorage (declared after `normalizeUrlInput` below — forward reference ok at call time). */
+function normalizeSiteKey(url) {
+  const n = normalizeUrlInput(url);
+  if (!n) return '';
+  try {
+    const u = new URL(n);
+    const host = u.hostname.replace(/^www\./i, '').toLowerCase();
+    let path = u.pathname || '/';
+    if (path !== '/' && path.endsWith('/')) path = path.slice(0, -1);
+    return `${u.protocol}//${host}${path}`;
+  } catch {
+    return n;
+  }
+}
+
+const SITE_SESSIONS_KEY = 'viberegress_site_sessions_v1';
+const LAST_ACTIVE_SITE_KEY = 'viberegress_last_active_site_key';
+const LEGACY_SCAN_DRAFT_KEY = 'viberegress_welcome_scan_draft_v1';
+
+/** Which site’s scan draft is currently active in the main views (welcome / discovery / content). */
+let activeSiteSessionKey = null;
+
+function loadSiteSessionsBlob() {
+  try {
+    const raw = localStorage.getItem(SITE_SESSIONS_KEY);
+    if (!raw) return { v: 1, sites: {} };
+    const o = JSON.parse(raw);
+    if (!o || o.v !== 1 || typeof o.sites !== 'object' || !o.sites) return { v: 1, sites: {} };
+    return o;
+  } catch {
+    return { v: 1, sites: {} };
+  }
+}
+
+function saveSiteSessionsBlob(blob) {
+  try {
+    localStorage.setItem(SITE_SESSIONS_KEY, JSON.stringify(blob));
+  } catch (_) { /* quota */ }
+}
+
+function getSiteSession(key) {
+  if (!key) return null;
+  return loadSiteSessionsBlob().sites[key] || null;
+}
+
+/**
+ * Ensures `discoveryLog` is present on a discovery payload using per-site session cache.
+ * The server sends a full log; we mirror it in `discoveryFullLog` so restores still show it
+ * if `discoveryResult` was saved without the string (quota) or from an older client.
+ */
+function attachDiscoveryFullLog(result, sess) {
+  if (!result || typeof result !== 'object') return result;
+  if (result.discoveryLog && String(result.discoveryLog).trim()) return result;
+  const cached = sess && typeof sess.discoveryFullLog === 'string' ? sess.discoveryFullLog : '';
+  if (!cached || !String(cached).trim()) return result;
+  const copy = JSON.parse(JSON.stringify(result));
+  copy.discoveryLog = cached;
+  return copy;
+}
+
+function upsertSiteSession(key, partial) {
+  if (!key) return;
+  const blob = loadSiteSessionsBlob();
+  const prev = blob.sites[key] || {};
+  blob.sites[key] = {
+    ...prev,
+    ...partial,
+    updatedAt: new Date().toISOString(),
+  };
+  saveSiteSessionsBlob(blob);
+}
+
+function deleteSiteSession(key) {
+  if (!key) return;
+  const blob = loadSiteSessionsBlob();
+  delete blob.sites[key];
+  saveSiteSessionsBlob(blob);
+}
+
+function migrateLegacyScanDraftOnce() {
+  try {
+    const raw = sessionStorage.getItem(LEGACY_SCAN_DRAFT_KEY);
+    if (!raw) return;
+    const d = JSON.parse(raw);
+    sessionStorage.removeItem(LEGACY_SCAN_DRAFT_KEY);
+    if (!d || d.v !== 1 || !d.scanUrl) return;
+    const key = normalizeSiteKey(d.scanUrl);
+    if (!key) return;
+    upsertSiteSession(key, {
+      siteUrl: normalizeUrlInput(d.scanUrl) || d.scanUrl,
+      headless: d.headless !== false,
+      authProfileId: d.authProfileId || '',
+      preview: d.preview || null,
+      uiStep: d.uiStep || 'url',
+      discoveryResult: null,
+    });
+    if (!localStorage.getItem(LAST_ACTIVE_SITE_KEY)) localStorage.setItem(LAST_ACTIVE_SITE_KEY, key);
+  } catch (_) { /* ignore */ }
+}
+
+function isSiteDashboardViewActive() {
+  return !!(views.site && views.site.classList.contains('active'));
+}
+
+function getCurrentScanSiteKey() {
+  if (isSiteDashboardViewActive() && selectedSiteUrl) return normalizeSiteKey(selectedSiteUrl);
+  if (discoveredScenarios && discoveredScenarios.siteUrl) return normalizeSiteKey(discoveredScenarios.siteUrl);
+  const fromInput = normalizeSiteKey(($('scan-url') && $('scan-url').value.trim()) || '');
+  if (fromInput) return fromInput;
+  if (sitePreviewResult && sitePreviewResult.siteUrl) return normalizeSiteKey(sitePreviewResult.siteUrl);
+  return activeSiteSessionKey || '';
+}
+
+function readWelcomeUiStep() {
+  if (views.site && views.site.classList.contains('active')) return 'site';
+  if (views.discovery && views.discovery.classList.contains('active')) return 'discovery';
+  if (views.contentCheck && views.contentCheck.classList.contains('active')) return 'content';
+  const stepChoose = $('welcome-step-choose');
+  if (stepChoose && !stepChoose.hidden) return 'choose';
+  return 'url';
+}
+
+function shouldPersistScanSession() {
+  if (views.welcome && views.welcome.classList.contains('active')) return true;
+  if (views.discovery && views.discovery.classList.contains('active')) return true;
+  if (views.contentCheck && views.contentCheck.classList.contains('active')) return true;
+  if (views.site && views.site.classList.contains('active')) return true;
+  return false;
+}
+
+/** Persist in-progress scan for the current site to localStorage and refresh the sidebar. */
+function syncSiteSessionFromUi() {
+  const key = getCurrentScanSiteKey();
+  if (!key || !shouldPersistScanSession()) return;
+  activeSiteSessionKey = key;
+  const siteUrl =
+    normalizeUrlInput(($('scan-url') && $('scan-url').value.trim()) || '') ||
+    discoveredScenarios?.siteUrl ||
+    sitePreviewResult?.siteUrl ||
+    key;
+  const patch = {
+    siteUrl,
+    headless: $('scan-headless') ? $('scan-headless').checked : true,
+    authProfileId: ($('scan-auth-profile') && $('scan-auth-profile').value) || '',
+    preview: sitePreviewResult,
+    uiStep: readWelcomeUiStep(),
+    discoveryResult: discoveredScenarios,
+    contentCheckResult,
+    contentCheckInput: readContentCheckInputFromUi(),
+  };
+  if (discoveredScenarios && typeof discoveredScenarios.discoveryLog === 'string' && discoveredScenarios.discoveryLog.trim()) {
+    patch.discoveryFullLog = discoveredScenarios.discoveryLog;
+  }
+  upsertSiteSession(key, patch);
+  try {
+    localStorage.setItem(LAST_ACTIVE_SITE_KEY, key);
+  } catch (_) {}
+  renderSidebarList();
+}
+
+function persistWelcomeScanDraft() {
+  syncSiteSessionFromUi();
+}
+
+let _scanDraftDebounceTimer;
+function schedulePersistWelcomeScanDraft() {
+  clearTimeout(_scanDraftDebounceTimer);
+  _scanDraftDebounceTimer = setTimeout(() => syncSiteSessionFromUi(), 400);
+}
+
+function allSidebarSiteKeys() {
+  const blob = loadSiteSessionsBlob();
+  const keys = new Set(Object.keys(blob.sites));
+  for (const s of scenarios) {
+    if (s.siteUrl) keys.add(normalizeSiteKey(s.siteUrl));
+  }
+  return [...keys].filter(Boolean).sort((a, b) => hostnameFromUrl(a).localeCompare(hostnameFromUrl(b)));
+}
+
+function displayUrlForSiteKey(key) {
+  const sess = getSiteSession(key);
+  if (sess && sess.siteUrl) return sess.siteUrl;
+  const sc = scenarios.find((s) => normalizeSiteKey(s.siteUrl) === key);
+  if (sc && sc.siteUrl) return sc.siteUrl;
+  return key;
+}
+
+/**
+ * Open saved workspace for a site: preview chooser, discovery draft, content check, or scenario dashboard.
+ * @param {boolean | { restoreContentTab?: boolean; preferSiteHome?: boolean }} [options] If `true`, same as `{ preferSiteHome: true }`. `restoreContentTab`: after reload, reopen Check content when that was last saved. `preferSiteHome`: from sidebar / breadcrumb — leave the discovery page for the site hub (chooser or dashboard).
+ */
+function activateSiteWorkspace(siteUrlRaw, options = {}) {
+  const opts = typeof options === 'boolean' ? { preferSiteHome: options } : options;
+  const restoreContentTab = opts.restoreContentTab === true;
+  const preferSiteHome = opts.preferSiteHome === true;
+  const key = normalizeSiteKey(siteUrlRaw);
+  if (!key) return;
+  activeScenarioId = null;
+  const sess = getSiteSession(key);
+  const displayUrl = displayUrlForSiteKey(key);
+  activeSiteSessionKey = key;
+  try {
+    localStorage.setItem(LAST_ACTIVE_SITE_KEY, key);
+  } catch (_) {}
+
+  const urlEl = $('scan-url');
+  if (urlEl) urlEl.value = displayUrl;
+  if ($('scan-headless') && sess && typeof sess.headless === 'boolean') $('scan-headless').checked = sess.headless;
+  syncScanWelcomeAuthDefaults();
+  renderAuthProfileSelects();
+  const sel = $('scan-auth-profile');
+  if (sel && sess && sess.authProfileId && [...sel.options].some((o) => o.value === sess.authProfileId)) {
+    sel.value = sess.authProfileId;
+  }
+
+  sitePreviewResult = sess && sess.preview && typeof sess.preview === 'object' ? { ...sess.preview } : null;
+  discoveredScenarios =
+    sess && sess.discoveryResult && typeof sess.discoveryResult === 'object'
+      ? attachDiscoveryFullLog(JSON.parse(JSON.stringify(sess.discoveryResult)), sess)
+      : null;
+
+  const ui = (sess && sess.uiStep) || 'url';
+  const hasDiscovery =
+    discoveredScenarios &&
+    Array.isArray(discoveredScenarios.scenarios) &&
+    discoveredScenarios.scenarios.length > 0;
+  const scenForSite = scenarios.filter((s) => normalizeSiteKey(s.siteUrl) === key);
+
+  // 1) Unsaved discovery — keep in-progress work unless user explicitly asked for site home (sidebar / breadcrumb).
+  if (!preferSiteHome && ui === 'discovery' && hasDiscovery) {
+    renderDiscovery(discoveredScenarios);
+    showView('discovery');
+    renderSidebarList();
+    return;
+  }
+  // 2) Saved scenarios — site dashboard is the main hub for this site.
+  if (scenForSite.length > 0) {
+    selectedSiteUrl = scenForSite[0].siteUrl;
+    openSite(selectedSiteUrl);
+    renderSidebarList();
+    return;
+  }
+  // 3) Check content tab — only when restoring after reload (sidebar always goes to chooser or dashboard).
+  if (restoreContentTab && ui === 'content' && sitePreviewResult) {
+    const sub = $('content-check-url');
+    if (sub) sub.textContent = displayUrl;
+    fillSitePreviewIntoDom('content-check-preview', sitePreviewResult);
+    applyContentCheckSessionFromStore(sess || {});
+    setContentCheckError('');
+    showView('contentCheck');
+    renderSidebarList();
+    return;
+  }
+  // 4) Homepage preview done — scenarios vs content chooser (includes previous “content” when clicking site).
+  if ((ui === 'choose' || ui === 'discovery' || ui === 'content') && sitePreviewResult) {
+    fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+    showWelcomeChooseStep();
+    showView('welcome');
+    syncSiteSessionFromUi();
+    renderSidebarList();
+    return;
+  }
+  if (sitePreviewResult) {
+    fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+    showWelcomeChooseStep();
+    showView('welcome');
+    syncSiteSessionFromUi();
+    renderSidebarList();
+    return;
+  }
+  resetWelcomeToUrlStep();
+  showView('welcome');
+  syncSiteSessionFromUi();
+  renderSidebarList();
+}
+
+/** After loading auth/scenarios: restore last site only if preview or unsaved discovery exists. */
+function tryRestoreLastSiteSession() {
+  migrateLegacyScanDraftOnce();
+  const last = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
+  if (!last) return false;
+  const sess = getSiteSession(last);
+  if (!sess) return false;
+  const inProgress =
+    sess.preview ||
+    (sess.discoveryResult &&
+      sess.discoveryResult.scenarios &&
+      sess.discoveryResult.scenarios.length) ||
+    sess.contentCheckResult ||
+    (sess.uiStep === 'content' && sess.preview);
+  if (!inProgress) return false;
+  activateSiteWorkspace(last, { restoreContentTab: true });
+  return true;
+}
+
+window.activateSiteWorkspace = activateSiteWorkspace;
+
+window.addEventListener('beforeunload', () => {
+  try {
+    syncSiteSessionFromUi();
+  } catch (_) { /* ignore */ }
+});
+
+function resetWelcomeToUrlStep() {
+  sitePreviewResult = null;
+  const stepUrl = $('welcome-step-url');
+  const stepChoose = $('welcome-step-choose');
+  if (stepUrl) stepUrl.hidden = false;
+  if (stepChoose) stepChoose.hidden = true;
+  if (views.welcome && views.welcome.classList.contains('active')) refreshMainBreadcrumb('welcome');
+}
+
+function showWelcomeChooseStep() {
+  const stepUrl = $('welcome-step-url');
+  const stepChoose = $('welcome-step-choose');
+  if (stepUrl) stepUrl.hidden = true;
+  if (stepChoose) stepChoose.hidden = false;
+  if (views.welcome && views.welcome.classList.contains('active')) refreshMainBreadcrumb('welcome');
+}
+
+function fillSitePreviewIntoDom(prefix, preview) {
+  if (!preview) return;
+  const urlEl = $(`${prefix}-url`);
+  const titleEl = $(`${prefix}-title`);
+  const headlineEl = $(`${prefix}-headline`);
+  const summaryEl = $(`${prefix}-summary`);
+  const authEl = $(`${prefix}-auth-note`);
+  if (urlEl) urlEl.textContent = preview.resolvedUrl || preview.siteUrl || '';
+  if (titleEl) titleEl.textContent = preview.title || 'Untitled page';
+  if (headlineEl) {
+    const h = (preview.mainHeadline || '').trim();
+    const t = (preview.title || '').trim();
+    if (h && h !== t) {
+      headlineEl.textContent = h;
+      headlineEl.hidden = false;
+    } else {
+      headlineEl.textContent = '';
+      headlineEl.hidden = true;
+    }
+  }
+  if (summaryEl) summaryEl.textContent = preview.summary || '';
+  if (authEl) authEl.hidden = !preview.requireAuth;
+}
+
+function readContentCheckInputFromUi() {
+  if (isSiteDashboardViewActive()) {
+    const p = $('site-dash-content-persona');
+    const inf = $('site-dash-content-infer-persona');
+    if (p) {
+      return {
+        persona: (p.value || '').trim(),
+        inferPersona: !!(inf && inf.checked),
+      };
+    }
+  }
+  const p = $('content-check-persona');
+  const inf = $('content-check-infer-persona');
+  return {
+    persona: p ? (p.value || '').trim() : '',
+    inferPersona: inf ? inf.checked : false,
+  };
+}
+
+function mirrorContentCheckInputsAcrossPanels(source) {
+  const persona = source && typeof source.persona === 'string' ? source.persona : '';
+  const infer = !!(source && source.inferPersona);
+  const p1 = $('content-check-persona');
+  const i1 = $('content-check-infer-persona');
+  const p2 = $('site-dash-content-persona');
+  const i2 = $('site-dash-content-infer-persona');
+  if (p1) p1.value = persona;
+  if (i1) i1.checked = infer;
+  if (p2) p2.value = persona;
+  if (i2) i2.checked = infer;
+}
+
+function setContentCheckError(msg) {
+  for (const id of ['content-check-error', 'site-dash-content-error']) {
+    const e = $(id);
+    if (!e) continue;
+    if (!msg) {
+      e.textContent = '';
+      e.classList.add('hidden');
+    } else {
+      e.textContent = msg;
+      e.classList.remove('hidden');
+    }
+  }
+}
+
+function applyContentCheckSessionFromStore(sess) {
+  const s = sess && typeof sess === 'object' ? sess : {};
+  const input = s.contentCheckInput && typeof s.contentCheckInput === 'object' ? s.contentCheckInput : {};
+  mirrorContentCheckInputsAcrossPanels({
+    persona: typeof input.persona === 'string' ? input.persona : '',
+    inferPersona: !!input.inferPersona,
+  });
+  contentCheckResult =
+    s.contentCheckResult && typeof s.contentCheckResult === 'object'
+      ? JSON.parse(JSON.stringify(s.contentCheckResult))
+      : null;
+  renderContentCheckReport(contentCheckResult);
+}
+
+function buildContentCheckReportHtml(result) {
+  if (!result || !Array.isArray(result.pages) || result.pages.length === 0) {
+    return '<p class="content-check-results-empty">Run a check to see judgments, scores, and evidence snippets.</p>';
+  }
+  const pu = result.personaUsed || {};
+  const confPct = typeof pu.confidence === 'number' ? Math.round(pu.confidence * 100) : null;
+  let html = '';
+  html += '<div class="content-check-persona-used">';
+  html +=
+    '<p class="content-check-persona-meta">Persona (' +
+    escapeHtml(pu.source || '') +
+    (confPct != null ? ' · ' + confPct + '% confidence' : '') +
+    ')</p>';
+  html += '<p>' + escapeHtml(pu.text || '') + '</p>';
+  html += '</div>';
+  if (result.siteSummary && String(result.siteSummary).trim()) {
+    html +=
+      '<p class="content-check-site-summary">' + escapeHtml(String(result.siteSummary).trim()) + '</p>';
+  }
+  for (const pg of result.pages) {
+    html += '<article class="content-check-page-card">';
+    html += '<h3>' + escapeHtml(pg.title || 'Page') + '</h3>';
+    html += '<p class="content-check-page-url">' + escapeHtml(pg.url || '') + '</p>';
+    html += '<div class="content-check-scores">';
+    html += '<span class="content-check-score">Fit ' + escapeHtml(String(pg.fit ?? '—')) + '/100</span>';
+    html += '<span class="content-check-score">Clarity ' + escapeHtml(String(pg.clarity ?? '—')) + '/100</span>';
+    html += '<span class="content-check-score">Trust ' + escapeHtml(String(pg.trust ?? '—')) + '/100</span>';
+    html += '<span class="content-check-score">Friction ' + escapeHtml(String(pg.friction ?? '—')) + '/100</span>';
+    html += '</div>';
+    if (Array.isArray(pg.strengths) && pg.strengths.length) {
+      html += '<p class="panel-label" style="margin-bottom:6px;">Strengths</p><ul class="content-check-list">';
+      for (const t of pg.strengths) {
+        html += '<li>' + escapeHtml(t) + '</li>';
+      }
+      html += '</ul>';
+    }
+    if (Array.isArray(pg.risks) && pg.risks.length) {
+      html += '<p class="panel-label" style="margin-bottom:6px;">Risks</p><ul class="content-check-list">';
+      for (const t of pg.risks) {
+        html += '<li>' + escapeHtml(t) + '</li>';
+      }
+      html += '</ul>';
+    }
+    if (Array.isArray(pg.recommendations) && pg.recommendations.length) {
+      html += '<p class="panel-label" style="margin-bottom:6px;">Recommendations</p><ul class="content-check-list">';
+      for (const t of pg.recommendations) {
+        html += '<li>' + escapeHtml(t) + '</li>';
+      }
+      html += '</ul>';
+    }
+    const snippets = Array.isArray(pg.evidenceSnippets) ? pg.evidenceSnippets : [];
+    if (snippets.length) {
+      html += '<p class="panel-label" style="margin-bottom:6px;">Evidence</p><ul class="content-check-snippets">';
+      for (const sn of snippets) {
+        const q = sn && sn.quote != null ? String(sn.quote) : '';
+        const note = sn && sn.note ? String(sn.note) : '';
+        html += '<li>';
+        if (note) html += escapeHtml(note) + '<br />';
+        html += '<blockquote>' + escapeHtml(q) + '</blockquote>';
+        html += '</li>';
+      }
+      html += '</ul>';
+    }
+    html += '</article>';
+  }
+  if (Array.isArray(result.crawlErrors) && result.crawlErrors.length) {
+    html +=
+      '<div class="content-check-crawl-errors"><strong>Crawl notes</strong><ul class="content-check-list">';
+    for (const err of result.crawlErrors) {
+      html += '<li>' + escapeHtml(err) + '</li>';
+    }
+    html += '</ul></div>';
+  }
+  return html;
+}
+
+function renderContentCheckReport(result) {
+  const inner = buildContentCheckReportHtml(result);
+  const el1 = $('content-check-results');
+  const el2 = $('site-dash-content-results');
+  if (el1) el1.innerHTML = inner;
+  if (el2) el2.innerHTML = inner;
+}
+
 let shareTokenActive = null;
 let sharedSiteScenarios = [];
 let activeSharedScenario = null;
+let routesReady = false;
+let isHandlingPopState = false;
 
 function parseSharePath() {
   const m = /^\/share\/([^/]+)\/?$/.exec(window.location.pathname || '');
   return m ? m[1] : null;
 }
+
+function slugifyPart(input) {
+  const raw = String(input || '')
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return raw || 'item';
+}
+
+function slugifyScenarioName(name) {
+  return slugifyPart(name || 'scenario');
+}
+
+function slugifySiteHost(siteUrl) {
+  try {
+    const parsed = new URL(normalizeUrlInput(siteUrl) || siteUrl);
+    const host = (parsed.hostname || '').replace(/^www\./i, '');
+    return slugifyPart(host || siteUrl || 'site');
+  } catch {
+    return slugifyPart(siteUrl || 'site');
+  }
+}
+
+function buildScenarioPath(scenario) {
+  if (!scenario || !scenario.id) return '/';
+  return `/scenarios/${encodeURIComponent(scenario.id)}-${encodeURIComponent(slugifyScenarioName(scenario.name))}`;
+}
+
+function buildSitePath(siteUrl) {
+  return `/sites/${encodeURIComponent(slugifySiteHost(siteUrl))}`;
+}
+
+function parseAppPath(pathname) {
+  const path = pathname || '/';
+  const share = /^\/share\/([^/]+)\/?$/.exec(path);
+  if (share) return { type: 'share', token: share[1] || null };
+  const scenario = /^\/scenarios\/([^/]+)\/?$/.exec(path);
+  if (scenario) {
+    const segment = decodeURIComponent(scenario[1] || '').trim();
+    const uuid = segment.match(
+      /^([0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})(?:-.+)?$/i
+    );
+    return {
+      type: 'scenario',
+      scenarioId: uuid ? uuid[1] : segment,
+    };
+  }
+  const site = /^\/sites\/([^/]+)\/?$/.exec(path);
+  if (site) return { type: 'site', siteSlug: decodeURIComponent(site[1] || '').trim() };
+  return { type: 'other' };
+}
+
+function navigateTo(path, options = {}) {
+  const replace = options.replace === true;
+  const next = path || '/';
+  const current = window.location.pathname || '/';
+  if (current === next) return;
+  const state = { appPath: next };
+  if (replace) window.history.replaceState(state, '', next);
+  else window.history.pushState(state, '', next);
+}
+
+function canonicalizeScenarioRoute(scenario) {
+  if (!scenario || !scenario.id) return;
+  const canonical = buildScenarioPath(scenario);
+  navigateTo(canonical, { replace: true });
+}
+
+function collectKnownSiteUrls() {
+  const urls = [];
+  const seen = new Set();
+  const add = (u) => {
+    const normalized = normalizeUrlInput(u) || (u || '').trim();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    urls.push(normalized);
+  };
+  for (const s of scenarios) add(s && s.siteUrl);
+  const blob = loadSiteSessionsBlob();
+  const sites = (blob && blob.sites) || {};
+  Object.keys(sites).forEach((k) => {
+    const sess = sites[k];
+    add(sess && sess.siteUrl ? sess.siteUrl : k);
+  });
+  return urls;
+}
+
+function resolveSiteUrlFromSlug(siteSlug) {
+  if (!siteSlug) return null;
+  const target = slugifyPart(siteSlug);
+  const known = collectKnownSiteUrls();
+  if (!known.length) return null;
+  const matches = known.filter((u) => slugifySiteHost(u) === target);
+  if (!matches.length) return null;
+  if (matches.length === 1) return matches[0];
+  const lastKey = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
+  if (lastKey) {
+    const preferred = matches.find((u) => normalizeSiteKey(u) === normalizeSiteKey(lastKey));
+    if (preferred) return preferred;
+  }
+  return matches[0];
+}
+
+function applyPathRoute(pathname, options = {}) {
+  const route = parseAppPath(pathname);
+  if (route.type === 'scenario') {
+    const scenario = scenarios.find((s) => s.id === route.scenarioId);
+    if (!scenario) return false;
+    openScenario(scenario.id, {
+      updateHistory: false,
+      canonicalizeRoute: options.canonicalize !== false,
+    });
+    return true;
+  }
+  if (route.type === 'site') {
+    const siteUrl = resolveSiteUrlFromSlug(route.siteSlug);
+    if (!siteUrl) return false;
+    openSite(siteUrl, { updateHistory: false });
+    return true;
+  }
+  return false;
+}
+
+window.addEventListener('popstate', () => {
+  if (!routesReady || parseSharePath()) return;
+  isHandlingPopState = true;
+  const handled = applyPathRoute(window.location.pathname, { canonicalize: true });
+  if (!handled) {
+    resetWelcomeToUrlStep();
+    showView('welcome');
+  }
+  isHandlingPopState = false;
+});
 
 // ─── View switching ──────────────────────────────────────────────────
 function showView(name) {
@@ -74,6 +741,120 @@ function showView(name) {
   });
   const v = views[name];
   if (v) v.classList.add('active');
+  refreshMainBreadcrumb(name);
+}
+
+function siteUrlForBreadcrumb() {
+  if (views.scenario && views.scenario.classList.contains('active') && activeScenarioId) {
+    const s = scenarios.find((x) => x.id === activeScenarioId);
+    if (s && s.siteUrl) return s.siteUrl;
+  }
+  if (selectedSiteUrl) return selectedSiteUrl;
+  if (discoveredScenarios && discoveredScenarios.siteUrl) return discoveredScenarios.siteUrl;
+  if (sitePreviewResult) return sitePreviewResult.resolvedUrl || sitePreviewResult.siteUrl || '';
+  const raw = ($('scan-url') && $('scan-url').value.trim()) || '';
+  return normalizeUrlInput(raw) || raw;
+}
+
+/** Sidebar / breadcrumb: site hub = saved-scenario dashboard if any exist, else welcome chooser. */
+function goToSiteHubFromUrl(siteUrlRaw) {
+  const u = siteUrlRaw && String(siteUrlRaw).trim();
+  if (u) activateSiteWorkspace(u, true);
+}
+
+function refreshMainBreadcrumb(viewName) {
+  const nav = $('main-breadcrumb');
+  if (!nav) return;
+  nav.replaceChildren();
+
+  const url = siteUrlForBreadcrumb();
+  const host = url ? hostnameFromUrl(url) : '';
+
+  /** @type {{ text: string, onNavigate?: () => void }[]} */
+  let segments = [];
+
+  switch (viewName) {
+    case 'welcome': {
+      const chooseVisible = $('welcome-step-choose') && !$('welcome-step-choose').hidden;
+      if (chooseVisible && host) segments.push({ text: host });
+      break;
+    }
+    case 'discovery':
+      if (host) {
+        const navUrl = url;
+        segments.push({ text: host, onNavigate: () => goToSiteHubFromUrl(navUrl) });
+        segments.push({ text: 'Discover scenarios' });
+      }
+      break;
+    case 'contentCheck':
+      if (host) {
+        const navUrl = url;
+        segments.push({ text: host, onNavigate: () => goToSiteHubFromUrl(navUrl) });
+        segments.push({ text: 'Check content' });
+      }
+      break;
+    case 'site':
+      if (host) {
+        segments.push({ text: host });
+        segments.push({ text: 'Dashboard' });
+      }
+      break;
+    case 'scenario': {
+      const s = scenarios.find((x) => x.id === activeScenarioId);
+      if (host && s) {
+        const navUrl = s.siteUrl || url;
+        segments.push({ text: host, onNavigate: () => goToSiteHubFromUrl(navUrl) });
+        segments.push({ text: s.name });
+      }
+      break;
+    }
+    case 'authProfiles':
+      segments.push({ text: 'Auth profiles' });
+      break;
+    case 'account':
+      segments.push({ text: 'My account' });
+      break;
+    case 'sharedSite': {
+      const su = ($('shared-site-url') && $('shared-site-url').textContent.trim()) || '';
+      const sh = su ? hostnameFromUrl(su) : '';
+      segments.push({ text: sh ? `Shared · ${sh}` : 'Shared site' });
+      break;
+    }
+    case 'sharedScenario':
+      segments.push({ text: 'Shared scenario' });
+      break;
+    default:
+      break;
+  }
+
+  if (!segments.length) {
+    nav.hidden = true;
+    return;
+  }
+
+  nav.hidden = false;
+  segments.forEach((seg, i) => {
+    if (i > 0) {
+      const sep = document.createElement('span');
+      sep.className = 'main-breadcrumb-sep';
+      sep.setAttribute('aria-hidden', 'true');
+      sep.textContent = '/';
+      nav.appendChild(sep);
+    }
+    if (seg.onNavigate) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'main-breadcrumb-link';
+      btn.textContent = seg.text;
+      btn.addEventListener('click', seg.onNavigate);
+      nav.appendChild(btn);
+    } else {
+      const span = document.createElement('span');
+      span.className = 'main-breadcrumb-current';
+      span.textContent = seg.text;
+      nav.appendChild(span);
+    }
+  });
 }
 
 // ─── Overlay ─────────────────────────────────────────────────────────
@@ -115,6 +896,9 @@ function runFetchHeaders(jsonBody) {
 let siteBatchRunning = false;
 /** Clears run dashboard when switching to a different site. */
 let lastSiteDashboardUrl = null;
+/** Re-run session → content form hydrate only when switching sites (avoids clobbering in-progress edits). */
+let lastSiteContentHydrateKey = '';
+let siteDashboardPreviewInFlightKey = null;
 
 function updateSiteRunAllButton() {
   const btn = $('btn-site-run-all');
@@ -271,6 +1055,8 @@ document.addEventListener('click', (e) => {
 });
 
 async function loadAccountView() {
+  const advEl = $('account-advanced-view');
+  if (advEl) advEl.checked = isAdvancedView();
   const emailEl = $('account-email');
   const lineEl = $('account-usage-line');
   const resetEl = $('account-usage-reset');
@@ -734,7 +1520,10 @@ async function initAuth() {
             openScenario(scenarios[0].id);
           } else {
             activeScenarioId = null;
-            showView('welcome');
+            if (!tryRestoreLastSiteSession()) {
+              resetWelcomeToUrlStep();
+              showView('welcome');
+            }
           }
         } catch (_) { /* ignore */ }
       });
@@ -772,7 +1561,7 @@ function updateAuthChrome() {
     const anonActions = $('auth-user-actions-anon');
     if (anonActions) anonActions.classList.remove('hidden');
     if (btnOut) btnOut.hidden = true;
-    if (btnAcct) btnAcct.classList.add('hidden');
+    if (btnAcct) btnAcct.classList.remove('hidden');
   }
 }
 
@@ -809,6 +1598,9 @@ function bindAccountUi() {
   $('btn-my-account')?.addEventListener('click', () => {
     showView('account');
     void loadAccountView();
+  });
+  $('account-advanced-view')?.addEventListener('change', (e) => {
+    setAdvancedView(!!(e.target && e.target.checked));
   });
   $('paywall-close')?.addEventListener('click', closePaywallModal);
   $('paywall-overlay')?.addEventListener('click', e => {
@@ -903,7 +1695,13 @@ function bindAuthUi() {
       renderSidebarList();
       await loadAuthProfiles();
       if (scenarios.length > 0) openScenario(scenarios[0].id);
-      else { activeScenarioId = null; showView('welcome'); }
+      else {
+        activeScenarioId = null;
+        if (!tryRestoreLastSiteSession()) {
+          resetWelcomeToUrlStep();
+          showView('welcome');
+        }
+      }
     } catch (_) {}
   });
 }
@@ -924,45 +1722,69 @@ function toggleSiteGroup(siteUrl) {
 
 function renderSidebarList() {
   const ul = $('scenario-list');
-  if (!scenarios.length) {
-    ul.innerHTML = '<li class="empty-state">No scenarios yet.<br/>Scan a site to get started.</li>';
+  const siteKeys = allSidebarSiteKeys();
+  if (!siteKeys.length) {
+    ul.innerHTML = '<li class="empty-state">No sites yet.<br/>Enter a URL and continue to get started.</li>';
     return;
   }
 
-  const grouped = new Map();
-  for (const s of scenarios) {
-    const key = s.siteUrl || 'Unknown';
-    if (!grouped.has(key)) grouped.set(key, []);
-    grouped.get(key).push(s);
-  }
-
-  // Auto-expand all groups on first render
   if (expandedSites.size === 0) {
-    for (const key of grouped.keys()) expandedSites.add(key);
+    for (const k of siteKeys) expandedSites.add(k);
   }
 
   let html = '';
-  const esc = u => u.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  for (const [siteUrl, items] of grouped) {
-    const isOpen = expandedSites.has(siteUrl);
-    const hostname = hostnameFromUrl(siteUrl);
+  const esc = (u) => u.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  for (const siteKey of siteKeys) {
+    const displayUrl = displayUrlForSiteKey(siteKey);
+    const items = scenarios.filter((s) => normalizeSiteKey(s.siteUrl) === siteKey);
+    const isOpen = expandedSites.has(siteKey);
+    const hostname = hostnameFromUrl(displayUrl);
+    const sess = getSiteSession(siteKey);
+    const inProgress =
+      sess &&
+      (sess.preview ||
+        (sess.discoveryResult &&
+          sess.discoveryResult.scenarios &&
+          sess.discoveryResult.scenarios.length));
+    const siteHeaderActive =
+      (activeSiteSessionKey === siteKey &&
+        views.welcome &&
+        views.welcome.classList.contains('active')) ||
+      (activeSiteSessionKey === siteKey &&
+        views.discovery &&
+        views.discovery.classList.contains('active')) ||
+      (activeSiteSessionKey === siteKey &&
+        views.contentCheck &&
+        views.contentCheck.classList.contains('active')) ||
+      (selectedSiteUrl &&
+        normalizeSiteKey(selectedSiteUrl) === siteKey &&
+        views.site &&
+        views.site.classList.contains('active'));
 
     html += `
       <li class="site-group">
-        <div class="site-header">
-          <span class="site-chevron ${isOpen ? 'open' : ''}" onclick="event.stopPropagation(); toggleSiteGroup('${esc(siteUrl)}')" role="button" aria-label="Expand/collapse">›</span>
-          <span class="site-favicon" title="${escapeHtml(siteUrl)}">⬡</span>
-          <span class="site-hostname site-open-link" role="button" onclick="event.stopPropagation(); openSite('${esc(siteUrl)}')">${hostname}</span>
+        <div class="site-header${siteHeaderActive ? ' site-header-active' : ''}">
+          <span class="site-chevron ${isOpen ? 'open' : ''}" onclick="event.stopPropagation(); toggleSiteGroup('${esc(siteKey)}')" role="button" aria-label="Expand/collapse">›</span>
+          <span class="site-favicon" title="${escapeHtml(displayUrl)}">⬡</span>
+          <span class="site-hostname site-open-link" role="button" tabindex="0" onclick="event.stopPropagation(); activateSiteWorkspace('${esc(displayUrl)}', true)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();activateSiteWorkspace('${esc(displayUrl)}', true)}">${escapeHtml(hostname)}</span>
+          ${inProgress && !items.length ? '<span class="site-draft-badge" title="Scan in progress">···</span>' : ''}
           <span class="site-count">${items.length}</span>
         </div>
         ${isOpen ? `<ul class="site-scenarios">
-          ${items.map(s => `
+          ${
+            items.length
+              ? items
+                  .map(
+                    (s) => `
             <li class="scenario-item ${s.lastStatus || 'never'} ${s.id === activeScenarioId ? 'active' : ''}"
                 data-id="${s.id}" onclick="openScenario('${s.id}')">
               <span class="s-dot"></span>
-              <span class="s-name">${s.name}</span>
-            </li>
-          `).join('')}
+              <span class="s-name">${escapeHtml(s.name)}</span>
+            </li>`
+                  )
+                  .join('')
+              : `<li class="scenario-item never" style="cursor:default;"><span class="s-dot"></span><span class="s-name muted">No saved scenarios yet</span></li>`
+          }
         </ul>` : ''}
       </li>`;
   }
@@ -970,19 +1792,83 @@ function renderSidebarList() {
   ul.innerHTML = html;
 }
 
-function openSite(siteUrl) {
+function openSite(siteUrl, options = {}) {
+  const updateHistory = options.updateHistory !== false;
   selectedSiteUrl = siteUrl || null;
+  if (siteUrl) {
+    activeSiteSessionKey = normalizeSiteKey(siteUrl);
+    try {
+      localStorage.setItem(LAST_ACTIVE_SITE_KEY, activeSiteSessionKey);
+    } catch (_) {}
+  }
   if (views.site) {
     renderSiteView();
     showView('site');
+  }
+  if (siteUrl && updateHistory && !isHandlingPopState) {
+    navigateTo(buildSitePath(siteUrl));
+  }
+}
+
+/** Loads homepage preview into the site dashboard Content column if not already in session. */
+async function ensureSiteDashboardPreview() {
+  if (!selectedSiteUrl) return;
+  const key = normalizeSiteKey(selectedSiteUrl);
+  const urlNorm = normalizeUrlInput(selectedSiteUrl) || selectedSiteUrl.replace(/\/$/, '');
+  const urlEl = $('scan-url');
+  if (urlEl) urlEl.value = urlNorm;
+  renderAuthProfileSelects();
+  const sess = getSiteSession(key) || {};
+  const sel = $('scan-auth-profile');
+  if (sel && sess.authProfileId && [...sel.options].some((o) => o.value === sess.authProfileId)) {
+    sel.value = sess.authProfileId;
+  }
+
+  let preview = sess.preview && typeof sess.preview === 'object' ? JSON.parse(JSON.stringify(sess.preview)) : null;
+  if (preview) {
+    fillSitePreviewIntoDom('site-dash-content-preview', preview);
+    sitePreviewResult = sitePreviewResult || preview;
+    return;
+  }
+  if (siteDashboardPreviewInFlightKey === key) return;
+  siteDashboardPreviewInFlightKey = key;
+  const summaryEl = $('site-dash-content-preview-summary');
+  if (summaryEl) summaryEl.textContent = 'Loading homepage preview…';
+  try {
+    const authProfileId = $('scan-auth-profile')?.value || undefined;
+    const headless = $('scan-headless') ? $('scan-headless').checked : true;
+    const previewNew = await api('POST', '/site-preview', {
+      url: urlNorm,
+      headless,
+      ...(authProfileId && { authProfileId }),
+    });
+    sitePreviewResult = previewNew;
+    upsertSiteSession(key, { preview: previewNew, siteUrl: urlNorm });
+    fillSitePreviewIntoDom('site-dash-content-preview', previewNew);
+  } catch (err) {
+    fillSitePreviewIntoDom('site-dash-content-preview', {
+      siteUrl: urlNorm,
+      resolvedUrl: urlNorm,
+      title: 'Preview unavailable',
+      mainHeadline: '',
+      summary: (err && err.message) || String(err),
+      requireAuth: false,
+    });
+  } finally {
+    if (siteDashboardPreviewInFlightKey === key) siteDashboardPreviewInFlightKey = null;
   }
 }
 
 function renderSiteView() {
   if (!selectedSiteUrl || !views.site) return;
-  const hostname = hostnameFromUrl(selectedSiteUrl);
-  $('site-page-title').textContent = hostname;
   $('site-page-url').textContent = selectedSiteUrl;
+
+  const siteKey = normalizeSiteKey(selectedSiteUrl);
+  if (lastSiteContentHydrateKey !== siteKey) {
+    lastSiteContentHydrateKey = siteKey;
+    applyContentCheckSessionFromStore(getSiteSession(siteKey) || {});
+  }
+  void ensureSiteDashboardPreview();
 
   const siteScenarios = scenarios.filter(s => (s.siteUrl || '') === selectedSiteUrl);
   const listEl = $('site-scenario-list');
@@ -1023,6 +1909,7 @@ function renderSiteView() {
       sumEl.textContent = '';
     }
   }
+  renderSiteExploreSection();
 }
 
 function renderSiteAuthList() {
@@ -1651,17 +2538,91 @@ function buildDiscoveryLogFallback(result, scenarios) {
 // ─── Scan / discover ─────────────────────────────────────────────────
 $('btn-new-site').onclick = () => {
   activeScenarioId = null;
+  activeSiteSessionKey = null;
+  try {
+    localStorage.removeItem(LAST_ACTIVE_SITE_KEY);
+  } catch (_) {}
   renderSidebarList();
+  resetWelcomeToUrlStep();
   showView('welcome');
   $('scan-url').focus();
 };
 
-$('btn-scan').onclick = async () => {
+$('btn-site-continue').onclick = async () => {
+  const urlRaw = $('scan-url').value.trim();
+  if (!urlRaw) return setHint('Please enter a URL.', true);
+  setHint('');
+
+  const key = normalizeSiteKey(urlRaw);
+  const authProfileId = $('scan-auth-profile')?.value || undefined;
+  const existing = getSiteSession(key);
+
+  if (existing && existing.discoveryResult && existing.discoveryResult.scenarios && existing.discoveryResult.scenarios.length) {
+    discoveredScenarios = attachDiscoveryFullLog(JSON.parse(JSON.stringify(existing.discoveryResult)), existing);
+    if (existing.preview && typeof existing.preview === 'object') {
+      sitePreviewResult = { ...existing.preview };
+    }
+    renderDiscovery(discoveredScenarios);
+    showView('discovery');
+    activeSiteSessionKey = key;
+    syncSiteSessionFromUi();
+    return;
+  }
+
+  if (existing && existing.preview && typeof existing.preview === 'object') {
+    sitePreviewResult = { ...existing.preview };
+    if (typeof existing.headless === 'boolean' && $('scan-headless')) $('scan-headless').checked = existing.headless;
+    const sel0 = $('scan-auth-profile');
+    if (sel0 && existing.authProfileId && [...sel0.options].some((o) => o.value === existing.authProfileId)) {
+      sel0.value = existing.authProfileId;
+    }
+    fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+    showWelcomeChooseStep();
+    activeSiteSessionKey = key;
+    syncSiteSessionFromUi();
+    return;
+  }
+
+  showOverlay('Opening ' + urlRaw + '…');
+  try {
+    sitePreviewResult = await api('POST', '/site-preview', {
+      url: urlRaw,
+      headless: $('scan-headless').checked,
+      ...(authProfileId && { authProfileId }),
+    });
+    fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+    showWelcomeChooseStep();
+    activeSiteSessionKey = key;
+    syncSiteSessionFromUi();
+  } catch (err) {
+    setHint('Error: ' + err.message, true);
+  } finally {
+    hideOverlay();
+  }
+};
+
+$('btn-welcome-change-url').onclick = () => {
+  resetWelcomeToUrlStep();
+  setHint('');
+  const key = normalizeSiteKey(($('scan-url') && $('scan-url').value.trim()) || '');
+  if (key) {
+    upsertSiteSession(key, {
+      preview: null,
+      uiStep: 'url',
+      discoveryResult: null,
+      discoveryFullLog: null,
+    });
+  }
+  syncSiteSessionFromUi();
+  $('scan-url').focus();
+};
+
+$('btn-welcome-scenarios').onclick = async () => {
   const url = $('scan-url').value.trim();
   if (!url) return setHint('Please enter a URL.', true);
   setHint('');
 
-  showOverlay('Scanning ' + url + '…');
+  showOverlay('Discovering scenarios…');
   const authProfileId = $('scan-auth-profile')?.value || undefined;
   try {
     discoveredScenarios = await api('POST', '/discover', {
@@ -1671,6 +2632,8 @@ $('btn-scan').onclick = async () => {
     });
     renderDiscovery(discoveredScenarios);
     showView('discovery');
+    activeSiteSessionKey = normalizeSiteKey(discoveredScenarios.siteUrl || url);
+    syncSiteSessionFromUi();
   } catch (err) {
     setHint('Error: ' + err.message, true);
   } finally {
@@ -1678,13 +2641,113 @@ $('btn-scan').onclick = async () => {
   }
 };
 
+$('btn-welcome-content').onclick = () => {
+  if (!sitePreviewResult) {
+    setHint('Preview missing. Use Continue from the URL step.', true);
+    return;
+  }
+  contentCheckBackTarget = 'welcome';
+  const key = normalizeSiteKey(
+    sitePreviewResult.siteUrl || (($('scan-url') && $('scan-url').value.trim()) || '')
+  );
+  const sess = key ? getSiteSession(key) : null;
+  applyContentCheckSessionFromStore(sess || {});
+  const sub = $('content-check-url');
+  if (sub) sub.textContent = sitePreviewResult.resolvedUrl || sitePreviewResult.siteUrl || '';
+  fillSitePreviewIntoDom('content-check-preview', sitePreviewResult);
+  setContentCheckError('');
+  showView('contentCheck');
+  syncSiteSessionFromUi();
+};
+
+$('btn-content-check-back').onclick = () => {
+  if (contentCheckBackTarget === 'site' && selectedSiteUrl) {
+    openSite(selectedSiteUrl);
+  } else {
+    showView('welcome');
+    showWelcomeChooseStep();
+    persistWelcomeScanDraft();
+  }
+  contentCheckBackTarget = 'welcome';
+  syncSiteSessionFromUi();
+};
+
+async function runContentCheckRequest() {
+  const urlRaw = isSiteDashboardViewActive() && selectedSiteUrl
+    ? normalizeUrlInput(selectedSiteUrl) || selectedSiteUrl.replace(/\/$/, '')
+    : ($('scan-url') && $('scan-url').value.trim()) || (sitePreviewResult && sitePreviewResult.siteUrl) || '';
+  if (!urlRaw) {
+    setContentCheckError(
+      isSiteDashboardViewActive() ? 'No site URL for this dashboard.' : 'Enter a URL on the welcome step first.'
+    );
+    return;
+  }
+  const { persona, inferPersona } = readContentCheckInputFromUi();
+  const authProfileId = $('scan-auth-profile')?.value || undefined;
+  const headless = $('scan-headless') ? $('scan-headless').checked : true;
+  setContentCheckError('');
+  const btnDash = $('btn-site-dash-content-run');
+  const btnFull = $('btn-content-check-run');
+  if (btnDash) btnDash.disabled = true;
+  if (btnFull) btnFull.disabled = true;
+  showOverlay('Analyzing content…');
+  try {
+    contentCheckResult = await api('POST', '/content-check', {
+      url: urlRaw,
+      headless,
+      ...(authProfileId && { authProfileId }),
+      ...(persona ? { persona } : {}),
+      inferPersona,
+    });
+    renderContentCheckReport(contentCheckResult);
+    syncSiteSessionFromUi();
+  } catch (err) {
+    setContentCheckError(err.message || String(err));
+  } finally {
+    hideOverlay();
+    if (btnDash) btnDash.disabled = false;
+    if (btnFull) btnFull.disabled = false;
+  }
+}
+
+const btnContentCheckRun = $('btn-content-check-run');
+if (btnContentCheckRun) {
+  btnContentCheckRun.onclick = () => void runContentCheckRequest();
+}
+const btnSiteDashContentRun = $('btn-site-dash-content-run');
+if (btnSiteDashContentRun) {
+  btnSiteDashContentRun.onclick = () => void runContentCheckRequest();
+}
+
+const contentPersonaEl = $('content-check-persona');
+if (contentPersonaEl) {
+  contentPersonaEl.addEventListener('input', () => schedulePersistWelcomeScanDraft());
+}
+const contentInferEl = $('content-check-infer-persona');
+if (contentInferEl) {
+  contentInferEl.addEventListener('change', () => persistWelcomeScanDraft());
+}
+const siteDashPersonaEl = $('site-dash-content-persona');
+if (siteDashPersonaEl) {
+  siteDashPersonaEl.addEventListener('input', () => schedulePersistWelcomeScanDraft());
+}
+const siteDashInferEl = $('site-dash-content-infer-persona');
+if (siteDashInferEl) {
+  siteDashInferEl.addEventListener('change', () => persistWelcomeScanDraft());
+}
+
 $('scan-url').addEventListener('keydown', e => {
-  if (e.key === 'Enter') $('btn-scan').click();
+  if (e.key === 'Enter') $('btn-site-continue').click();
 });
 $('scan-url').addEventListener('input', () => {
   syncScanWelcomeAuthDefaults();
   renderAuthProfileSelects();
+  schedulePersistWelcomeScanDraft();
 });
+const scanHeadlessEl = $('scan-headless');
+if (scanHeadlessEl) scanHeadlessEl.addEventListener('change', () => schedulePersistWelcomeScanDraft());
+const scanAuthProfileEl = $('scan-auth-profile');
+if (scanAuthProfileEl) scanAuthProfileEl.addEventListener('change', () => persistWelcomeScanDraft());
 
 const scanWelcomeBaseUrl = $('scan-welcome-auth-base-url');
 if (scanWelcomeBaseUrl) {
@@ -1716,16 +2779,48 @@ function setHint(msg, isError = false) {
   el.className = 'hint' + (isError ? ' error' : '');
 }
 
-// ─── Discovery view ───────────────────────────────────────────────────
-function renderDiscovery(result) {
-  const allScenarios = Array.isArray(result.scenarios) ? result.scenarios : [];
-  const filtered = allScenarios;
-  $('discovery-title').textContent = `${filtered.length} scenarios discovered`;
-  $('discovery-url').textContent = result.siteUrl;
+/** Payload for `lastExploreSnapshot` in site session (visited pages, traces, log). */
+function extractExploreSnapshot(discoveryResult, sess) {
+  if (!discoveryResult || typeof discoveryResult !== 'object') return null;
+  const merged = attachDiscoveryFullLog(JSON.parse(JSON.stringify(discoveryResult)), sess || null);
+  const visitedPages = Array.isArray(merged.visitedPages) ? merged.visitedPages : [];
+  const intentTraces = Array.isArray(merged.intentTraces) ? merged.intentTraces : [];
+  const scenarios = Array.isArray(merged.scenarios) ? merged.scenarios : [];
+  const discoveryLog =
+    merged && typeof merged.discoveryLog === 'string' && merged.discoveryLog.trim()
+      ? merged.discoveryLog
+      : buildDiscoveryLogFallback(merged, scenarios);
+  return {
+    siteUrl: merged.siteUrl || '',
+    visitedPages,
+    intentTraces,
+    discoveryLog,
+    discoveryFullLog: discoveryLog,
+    ...(merged.crawlMeta && typeof merged.crawlMeta === 'object' ? { crawlMeta: merged.crawlMeta } : {}),
+  };
+}
 
-  const visitedPages = Array.isArray(result.visitedPages) ? result.visitedPages : [];
-  const intentTraces = Array.isArray(result.intentTraces) ? result.intentTraces : [];
-  const visitedHtml = visitedPages.length
+/**
+ * HTML for discovery “explore” panels (log, visited pages, intent traces) — no scenario cards.
+ * @param {object} logIds - optional `{ copy, textarea }` element ids for the log panel
+ */
+function buildDiscoveryExplorePanelsHtml(result, sess, scenariosForLogFallback, logIds) {
+  if (!result || typeof result !== 'object') return '';
+  const merged = attachDiscoveryFullLog(JSON.parse(JSON.stringify(result)), sess || null);
+  const visitedPages = Array.isArray(merged.visitedPages) ? merged.visitedPages : [];
+  const intentTraces = Array.isArray(merged.intentTraces) ? merged.intentTraces : [];
+  const scenFb =
+    scenariosForLogFallback !== undefined && scenariosForLogFallback !== null
+      ? scenariosForLogFallback
+      : Array.isArray(merged.scenarios)
+        ? merged.scenarios
+        : [];
+  const copyId = (logIds && logIds.copy) || 'discovery-log-copy';
+  const textId = (logIds && logIds.textarea) || 'discovery-log-text';
+  const showDiagnostics = isAdvancedView();
+
+  const visitedHtml =
+    showDiagnostics && visitedPages.length
     ? `
       <div class="discovery-visited panel">
         <p class="panel-label">Visited pages (${visitedPages.length})</p>
@@ -1766,20 +2861,109 @@ function renderDiscovery(result) {
     `
     : '';
 
-  const discoveryLogText = (result && typeof result.discoveryLog === 'string' && result.discoveryLog.trim())
-    ? result.discoveryLog
-    : buildDiscoveryLogFallback(result, filtered);
-  const discoveryLogHtml = `
+  const discoveryLogText =
+    merged && typeof merged.discoveryLog === 'string' && merged.discoveryLog.trim()
+      ? merged.discoveryLog
+      : buildDiscoveryLogFallback(merged, scenFb);
+  const discoveryLogHtml = showDiagnostics
+    ? `
     <div class="discovery-log panel">
       <div class="discovery-log-head">
         <p class="panel-label">Discovery full log</p>
-        <button type="button" class="btn-secondary btn-sm" id="discovery-log-copy">Copy log</button>
+        <button type="button" class="btn-secondary btn-sm" id="${copyId}">Copy log</button>
       </div>
-      <textarea id="discovery-log-text" class="input mono" rows="14" readonly>${escapeHtml(discoveryLogText)}</textarea>
+      <textarea id="${textId}" class="input mono" rows="14" readonly>${escapeHtml(discoveryLogText)}</textarea>
     </div>
-  `;
+  `
+    : '';
 
-  $('discovery-list').innerHTML = discoveryLogHtml + visitedHtml + traceHtml + filtered.map((s, i) => `
+  return discoveryLogHtml + visitedHtml + traceHtml;
+}
+
+function bindDiscoveryLogCopyBtn(copyBtnId, logTextareaId) {
+  const copyBtn = $(copyBtnId);
+  const logBox = $(logTextareaId);
+  if (!copyBtn || !logBox) return;
+  copyBtn.onclick = async () => {
+    const text = logBox.value || '';
+    try {
+      await navigator.clipboard.writeText(text);
+      const prev = copyBtn.textContent;
+      copyBtn.textContent = 'Copied';
+      setTimeout(() => {
+        copyBtn.textContent = prev;
+      }, 1200);
+    } catch (_) {
+      logBox.focus();
+      logBox.select();
+    }
+  };
+}
+
+function renderSiteExploreSection() {
+  const wrap = $('site-explore-section');
+  const inner = $('site-explore-inner');
+  if (!wrap || !inner || !selectedSiteUrl) {
+    if (wrap) wrap.classList.add('hidden');
+    return;
+  }
+  const key = normalizeSiteKey(selectedSiteUrl);
+  const sess = getSiteSession(key);
+  let source = null;
+  let attachSess = sess;
+  if (sess && sess.lastExploreSnapshot && typeof sess.lastExploreSnapshot === 'object') {
+    source = sess.lastExploreSnapshot;
+    attachSess = { discoveryFullLog: source.discoveryFullLog || source.discoveryLog || '' };
+  } else if (sess && sess.discoveryResult && typeof sess.discoveryResult === 'object') {
+    source = JSON.parse(JSON.stringify(sess.discoveryResult));
+  }
+  if (!source || typeof source !== 'object') {
+    wrap.classList.add('hidden');
+    inner.innerHTML = '';
+    return;
+  }
+  const exploreHtml = buildDiscoveryExplorePanelsHtml(source, attachSess, [], {
+    copy: 'site-explore-log-copy',
+    textarea: 'site-explore-log-text',
+  });
+  if (!exploreHtml.trim()) {
+    wrap.classList.add('hidden');
+    inner.innerHTML = '';
+    return;
+  }
+  wrap.classList.remove('hidden');
+  inner.innerHTML = `
+    <p class="panel-label">Explored content</p>
+    <p class="hint site-explore-hint">Pages and traces from the last scenario discovery in this browser. Scan the site again to refresh this section.</p>
+    ${exploreHtml}
+  `;
+  bindDiscoveryLogCopyBtn('site-explore-log-copy', 'site-explore-log-text');
+}
+
+// ─── Discovery view ───────────────────────────────────────────────────
+function renderDiscovery(result) {
+  const key =
+    getCurrentScanSiteKey() ||
+    (result && result.siteUrl ? normalizeSiteKey(result.siteUrl) : '');
+  const sess = key ? getSiteSession(key) : null;
+  const merged = attachDiscoveryFullLog(result, sess);
+  if (merged !== result && merged.discoveryLog && key) {
+    discoveredScenarios = merged;
+    upsertSiteSession(key, {
+      discoveryResult: merged,
+      discoveryFullLog: merged.discoveryLog,
+    });
+  }
+  result = merged;
+
+  const allScenarios = Array.isArray(result.scenarios) ? result.scenarios : [];
+  const filtered = allScenarios;
+  $('discovery-title').textContent = `${filtered.length} scenarios discovered`;
+  $('discovery-url').textContent = result.siteUrl;
+
+  const exploreHtml = buildDiscoveryExplorePanelsHtml(result, sess, filtered);
+
+  $('discovery-list').innerHTML = exploreHtml + filtered.map((s, i) => `
     <div class="scenario-card" data-index="${i}">
       <div class="scenario-card-header">
         <div>
@@ -1811,24 +2995,7 @@ function renderDiscovery(result) {
   $('discovery-list').querySelectorAll('.discovery-save-one').forEach((btn) => {
     btn.onclick = () => saveOneDiscoveredScenario(Number(btn.dataset.index));
   });
-  const copyBtn = $('discovery-log-copy');
-  const logBox = $('discovery-log-text');
-  if (copyBtn && logBox) {
-    copyBtn.onclick = async () => {
-      const text = logBox.value || '';
-      try {
-        await navigator.clipboard.writeText(text);
-        const prev = copyBtn.textContent;
-        copyBtn.textContent = 'Copied';
-        setTimeout(() => {
-          copyBtn.textContent = prev;
-        }, 1200);
-      } catch (_) {
-        logBox.focus();
-        logBox.select();
-      }
-    };
-  }
+  bindDiscoveryLogCopyBtn('discovery-log-copy', 'discovery-log-text');
 }
 
 async function saveOneDiscoveredScenario(index) {
@@ -1855,11 +3022,29 @@ async function saveOneDiscoveredScenario(index) {
     discoveredScenarios.scenarios.splice(index, 1);
     await loadScenarios();
     if (!discoveredScenarios.scenarios.length) {
+      const siteKey = normalizeSiteKey(
+        discoveredScenarios.siteUrl || ($('scan-url') && $('scan-url').value.trim()) || ''
+      );
+      const sessSnap = siteKey ? getSiteSession(siteKey) : null;
+      const exploreSnap = extractExploreSnapshot(discoveredScenarios, sessSnap);
       discoveredScenarios = null;
-      showView('welcome');
+      if (siteKey) {
+        upsertSiteSession(siteKey, {
+          discoveryResult: null,
+          uiStep: 'choose',
+          ...(exploreSnap ? { lastExploreSnapshot: exploreSnap } : {}),
+        });
+      }
+      if (siteKey) activateSiteWorkspace(siteKey);
+      else {
+        resetWelcomeToUrlStep();
+        showView('welcome');
+        renderSidebarList();
+      }
       return;
     }
     renderDiscovery(discoveredScenarios);
+    syncSiteSessionFromUi();
   } catch (err) {
     const details = err && err.details ? err.details : null;
     if (hint) {
@@ -1891,10 +3076,41 @@ $('btn-save-all').onclick = async () => {
   if (!discoveredScenarios) return;
   showOverlay('Saving scenarios…');
   try {
-    await api('POST', '/scenarios', { scenarios: discoveredScenarios.scenarios });
+    const siteKey = normalizeSiteKey(discoveredScenarios.siteUrl);
+    const siteUrlOpen = discoveredScenarios.siteUrl;
+    const sessBefore = siteKey ? getSiteSession(siteKey) : null;
+    const exploreSnap = extractExploreSnapshot(discoveredScenarios, sessBefore);
+    const saveResult = await api('POST', '/scenarios', { scenarios: discoveredScenarios.scenarios });
+    const partialFailures = saveResult && !Array.isArray(saveResult) && Array.isArray(saveResult.failed)
+      ? saveResult.failed
+      : [];
+    if (partialFailures.length) {
+      const first = partialFailures[0];
+      const more = partialFailures.length > 1 ? ` (+${partialFailures.length - 1} more)` : '';
+      alert(
+        `Saved with partial failures: ${partialFailures.length} scenario(s) could not be saved.\n` +
+        `First failure: ${first.scenarioName}: ${first.error}${more}`
+      );
+    }
     await loadScenarios();
-    showView('welcome');
     discoveredScenarios = null;
+    if (siteKey) {
+      upsertSiteSession(siteKey, {
+        discoveryResult: null,
+        uiStep: 'choose',
+        ...(exploreSnap ? { lastExploreSnapshot: exploreSnap } : {}),
+      });
+    }
+    activeSiteSessionKey = siteKey || null;
+    try {
+      if (siteKey) localStorage.setItem(LAST_ACTIVE_SITE_KEY, siteKey);
+    } catch (_) {}
+    if (siteUrlOpen) openSite(siteUrlOpen);
+    else {
+      resetWelcomeToUrlStep();
+      showView('welcome');
+    }
+    renderSidebarList();
   } catch (err) {
     alert('Failed to save: ' + err.message);
   } finally {
@@ -1972,6 +3188,10 @@ function renderScenarioTraceDetails(trace) {
 async function loadScenarioBuildLogs(scenarioId) {
   const container = $('scenario-build-logs');
   if (!container) return;
+  if (!isAdvancedView()) {
+    container.innerHTML = '<p class="run-idle">No generation logs yet.</p>';
+    return;
+  }
   container.innerHTML = '<p class="run-idle">Loading generation logs…</p>';
   try {
     const events = await api('GET', `/scenarios/${scenarioId}/build-logs`);
@@ -1995,11 +3215,14 @@ async function loadScenarioBuildLogs(scenarioId) {
 }
 
 // ─── Scenario detail ─────────────────────────────────────────────────
-async function openScenario(id) {
+async function openScenario(id, options = {}) {
+  const updateHistory = options.updateHistory !== false;
+  const canonicalizeRoute = options.canonicalizeRoute !== false;
   activeScenarioId = id;
+  const s = scenarios.find((x) => x.id === id);
+  if (s && s.siteUrl) activeSiteSessionKey = normalizeSiteKey(s.siteUrl);
   renderSidebarList();
 
-  const s = scenarios.find(x => x.id === id);
   if (!s) return;
 
   if (isLoggedIn()) await refreshMonthlyUsage();
@@ -2185,6 +3408,11 @@ async function openScenario(id) {
     };
   }
   showView('scenario');
+  if (s && updateHistory && !isHandlingPopState) {
+    navigateTo(buildScenarioPath(s));
+  } else if (s && !updateHistory && canonicalizeRoute) {
+    canonicalizeScenarioRoute(s);
+  }
 }
 
 function toggleStepEditor(index) {
@@ -2783,7 +4011,10 @@ $('btn-delete').onclick = async () => {
     await api('DELETE', `/scenarios/${activeScenarioId}`);
     activeScenarioId = null;
     await loadScenarios();
-    showView('welcome');
+    if (!tryRestoreLastSiteSession()) {
+      resetWelcomeToUrlStep();
+      showView('welcome');
+    }
   } catch (err) {
     alert('Failed to delete: ' + err.message);
   }
@@ -3013,9 +4244,19 @@ const RUN_HEADLESS_KEY = 'viberegress_run_headless';
   try {
     await loadScenarios();
     await loadAuthProfiles();
+    applyAdvancedViewPreference();
+    routesReady = true;
+    migrateLegacyScanDraftOnce();
+    if (applyPathRoute(window.location.pathname, { canonicalize: true })) {
+      return;
+    }
+    if (tryRestoreLastSiteSession()) {
+      return;
+    }
     if (scenarios.length > 0) {
       openScenario(scenarios[0].id);
     } else {
+      resetWelcomeToUrlStep();
       showView('welcome');
     }
   } catch (err) {
@@ -3025,6 +4266,10 @@ const RUN_HEADLESS_KEY = 'viberegress_run_headless';
       hint.textContent = err.message || 'Could not load data. Refresh or check you are online.';
       hint.className = 'hint error';
     }
-    showView('welcome');
+    migrateLegacyScanDraftOnce();
+    if (!tryRestoreLastSiteSession()) {
+      resetWelcomeToUrlStep();
+      showView('welcome');
+    }
   }
 })();

@@ -11,6 +11,7 @@ import { assembleRunContext } from './run-context-assembler.js';
 import type { Scenario, Step } from '../types/index.js';
 import type { RunForensicsContext } from '../types/index.js';
 import { logger } from '../lib/logger.js';
+import { extractPageStory, narrativeBlockForPrompt, type PageStory } from './page-story.js';
 
 const MODIFY_SCHEMA = z.object({
   name: z.string(),
@@ -38,6 +39,11 @@ export interface ModifyScenarioResult {
   steps: Step[];
 }
 
+/** Result of AI scenario generation with optional structured page narrative (null if extraction failed). */
+export interface ModifyScenarioResultWithPageStory extends ModifyScenarioResult {
+  pageStory: PageStory | null;
+}
+
 export interface ModifyScenarioStepInput {
   scenario: Scenario;
   stepIndex: number;
@@ -49,8 +55,10 @@ export interface ModifyScenarioStepResult {
   type: Step['type'];
 }
 
-function buildPreRunInstruction(scenario: Scenario, userMessage: string): string {
+function buildPreRunInstruction(scenario: Scenario, userMessage: string, narrativeBlock: string): string {
   return `You are modifying a test scenario according to the user's request. Apply exactly what they ask (e.g. remove a step, change text, reorder).
+
+${narrativeBlock}
 
 Current scenario:
 - Name: ${scenario.name}
@@ -67,6 +75,7 @@ Rules:
 - When a request combines multiple intents (for example action + verification), split it into separate ordered steps.
 - Put verifications in dedicated assertion-style steps when they are distinct from the user action.
 - Prefer assertions on stable, clearly visible end-state evidence. Avoid transient/intermediate checks (e.g. brief loading text like "Checking...") unless the user explicitly asks for that exact transient state.
+- Align new or updated steps with the page narrative above; do not add interactions with demo or low-priority sections unless the user request explicitly requires it.
 - Return name, description, and steps (array of instruction strings). Keep name/description unless the user asked to change them.`;
 }
 
@@ -82,9 +91,16 @@ function summarizeRunContext(ctx: RunForensicsContext): string {
   return lines.filter(Boolean).join('\n');
 }
 
-function buildPostRunInstruction(scenario: Scenario, runContext: RunForensicsContext, userMessage: string): string {
+function buildPostRunInstruction(
+  scenario: Scenario,
+  runContext: RunForensicsContext,
+  userMessage: string,
+  narrativeBlock: string
+): string {
   const runSummary = summarizeRunContext(runContext);
   return `You are modifying a test scenario. The user has seen a run and is asking for a change. Apply their request; you can use the run feedback below as context.
+
+${narrativeBlock}
 
 Current scenario:
 - Name: ${scenario.name}
@@ -103,18 +119,23 @@ Rules:
 - Keep steps atomic: each step should express one primary intent.
 - When a request combines multiple intents (for example action + verification), split it into separate ordered steps.
 - Put verifications in dedicated assertion-style steps when they are distinct from the user action.
+- Align steps with the page narrative above; avoid demo-only or decorative flows unless the user explicitly asks.
 - Return name, description, and steps (array of instruction strings).`;
 }
 
-function buildCreateFromPromptInstruction(siteUrl: string, userMessage: string): string {
+function buildCreateFromPromptInstruction(siteUrl: string, userMessage: string, narrativeBlock: string): string {
   return `You are creating a new test scenario for this website. The user describes what they want to test.
 
+Site URL: ${siteUrl}
 User request: "${userMessage}"
+
+${narrativeBlock}
 
 Rules:
 - Create a short scenario name and description that match the request.
 - Steps must be plain English instructions. Any step that involves typing MUST include the exact text in quotes (e.g. Type "pricing" in the search box).
 - Use a small number of steps (typically 3–8) that a browser could execute: navigate, click, type, assert text or visibility.
+- Follow the page narrative above for the primary user journey on this URL; do not add steps that interact with demo or decorative sections listed above unless the user explicitly asks to test those.
 - Return name, description, and steps (array of instruction strings).`;
 }
 
@@ -184,7 +205,7 @@ export function parseAndValidateModifyResult(raw: unknown): ModifyScenarioResult
  * will be loaded. Returns normalized name, description, and steps. Throws if AI output
  * is invalid or validation fails (no mutation).
  */
-export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<ModifyScenarioResult> {
+export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<ModifyScenarioResultWithPageStory> {
   const { scenario, mode, runId, userMessage } = input;
   const msg = (userMessage ?? '').trim();
   if (!msg) throw new Error('userMessage is required (e.g. "Don\'t do that step", "Remove step 2")');
@@ -201,11 +222,6 @@ export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<
     }
   }
 
-  const instruction =
-    mode === 'pre_run'
-      ? buildPreRunInstruction(scenario, input.userMessage)
-      : buildPostRunInstruction(scenario, runContext!, input.userMessage);
-
   const stagehand = new Stagehand({
     env: 'LOCAL',
     verbose: 1,
@@ -218,6 +234,13 @@ export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<
   const urlToLoad = scenario.startingWebpage?.trim() || scenario.siteUrl;
   try {
     await page.goto(urlToLoad, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const pageStory = await extractPageStory(page);
+    const narrativeBlock = narrativeBlockForPrompt(pageStory);
+    const instruction =
+      mode === 'pre_run'
+        ? buildPreRunInstruction(scenario, input.userMessage, narrativeBlock)
+        : buildPostRunInstruction(scenario, runContext!, input.userMessage, narrativeBlock);
+
     const raw = await page.extract({
       instruction,
       schema: MODIFY_SCHEMA,
@@ -225,7 +248,7 @@ export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<
 
     const result = parseAndValidateModifyResult(raw);
     logger.info('scenario_modify_success', { scenarioId: scenario.id, mode, stepCount: result.steps.length });
-    return result;
+    return { ...result, pageStory };
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('AI returned invalid scenario shape')) {
       logger.warn('scenario_modify_invalid_schema', { scenarioId: scenario.id, mode, error: err.message });
@@ -253,7 +276,7 @@ export interface CreateScenarioFromPromptInput {
  */
 export async function createScenarioFromPrompt(
   input: CreateScenarioFromPromptInput
-): Promise<ModifyScenarioResult> {
+): Promise<ModifyScenarioResultWithPageStory> {
   const { siteUrl, userMessage, startUrl } = input;
   const msg = (userMessage ?? '').trim();
   if (!msg) throw new Error('userMessage is required (e.g. "Check the pricing page", "Test login flow")');
@@ -272,7 +295,9 @@ export async function createScenarioFromPrompt(
 
   try {
     await page.goto(urlToLoad, { waitUntil: 'domcontentloaded', timeout: 15000 });
-    const instruction = buildCreateFromPromptInstruction(siteUrl, msg);
+    const pageStory = await extractPageStory(page);
+    const narrativeBlock = narrativeBlockForPrompt(pageStory);
+    const instruction = buildCreateFromPromptInstruction(siteUrl, msg, narrativeBlock);
     const raw = await page.extract({
       instruction,
       schema: MODIFY_SCHEMA,
@@ -280,7 +305,7 @@ export async function createScenarioFromPrompt(
 
     const result = parseAndValidateModifyResult(raw);
     logger.info('scenario_create_from_prompt_success', { siteUrl, stepCount: result.steps.length });
-    return result;
+    return { ...result, pageStory };
   } catch (err) {
     if (err instanceof Error && err.message.startsWith('AI returned invalid scenario shape')) {
       logger.warn('scenario_create_from_prompt_invalid_schema', { siteUrl, error: err.message });

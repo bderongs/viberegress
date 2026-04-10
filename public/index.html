@@ -55,15 +55,17 @@
 
     <!-- Main content -->
     <main id="main">
+      <nav id="main-breadcrumb" class="main-breadcrumb" aria-label="Breadcrumb" hidden></nav>
 
       <!-- Welcome / scan view -->
       <div id="view-welcome" class="view active">
         <div class="welcome-content">
           <h1>Catch regressions<br/><span class="accent">before your users do.</span></h1>
-          <p class="welcome-sub">Paste your site URL. VibeRegress discovers what matters, then watches for breakage on every deploy.</p>
+          <p class="welcome-sub">Enter your site URL. We open the homepage once, show you what we saw, then you choose scenario discovery or a content check.</p>
+          <div id="welcome-step-url">
           <div class="scan-box">
             <input type="url" id="scan-url" placeholder="https://your-site.com" autocomplete="off" spellcheck="false" />
-            <button class="btn-primary" id="btn-scan">Scan →</button>
+            <button type="button" class="btn-primary" id="btn-site-continue">Continue</button>
           </div>
           <label class="scan-headless-option">
             <input type="checkbox" id="scan-headless" checked />
@@ -113,7 +115,24 @@
             </div>
             <p class="auth-inline-empty hidden" id="scan-auth-empty">No auth profile found for this URL yet. Create one below.</p>
           </details>
-          <p class="hint" id="scan-hint"></p>
+          </div>
+          <div id="welcome-step-choose" class="welcome-step-choose" hidden>
+            <div class="site-preview-card panel">
+              <p class="panel-label">Homepage we loaded</p>
+              <p class="site-preview-url" id="site-preview-url"></p>
+              <h2 class="site-preview-title" id="site-preview-title"></h2>
+              <p class="site-preview-headline" id="site-preview-headline"></p>
+              <p class="site-preview-summary" id="site-preview-summary"></p>
+              <p class="hint site-preview-auth-note" id="site-preview-auth-note" hidden>This page may require sign-in. Use an auth profile if you haven’t already.</p>
+            </div>
+            <p class="welcome-choose-prompt">What would you like to do next?</p>
+            <div class="welcome-choose-actions">
+              <button type="button" class="btn-primary" id="btn-welcome-scenarios">Discover scenarios</button>
+              <button type="button" class="btn-secondary" id="btn-welcome-content">Check content</button>
+            </div>
+            <p class="welcome-change-url-wrap"><button type="button" class="btn-text-link" id="btn-welcome-change-url">Change URL</button></p>
+          </div>
+          <p class="hint welcome-scan-hint" id="scan-hint"></p>
         </div>
       </div>
 
@@ -127,6 +146,43 @@
           <button class="btn-primary" id="btn-save-all">Save all scenarios</button>
         </div>
         <div id="discovery-list" class="scenario-cards"></div>
+      </div>
+
+      <!-- Content check (persona / copy review — placeholder) -->
+      <div id="view-content-check" class="view">
+        <div class="view-header">
+          <div>
+            <h2>Check content</h2>
+            <p class="view-sub" id="content-check-url"></p>
+          </div>
+          <button type="button" class="btn-secondary" id="btn-content-check-back">Back</button>
+        </div>
+        <div class="content-check-body welcome-content">
+          <div class="site-preview-card panel">
+            <p class="panel-label">Page preview</p>
+            <p class="site-preview-url" id="content-check-preview-url"></p>
+            <h2 class="site-preview-title" id="content-check-preview-title"></h2>
+            <p class="site-preview-headline" id="content-check-preview-headline"></p>
+            <p class="site-preview-summary" id="content-check-preview-summary"></p>
+            <p class="hint site-preview-auth-note" id="content-check-preview-auth-note" hidden>This page may require sign-in.</p>
+          </div>
+          <div class="panel content-check-panel">
+            <p class="panel-label">Persona and run</p>
+            <p class="hint content-check-disclaimer">This is an advisory read of copy and UX for a persona — not a regression pass/f gate. Use <strong>Discover scenarios</strong> for saved journeys.</p>
+            <label class="content-check-label" for="content-check-persona">Persona (optional)</label>
+            <p class="hint content-check-label-hint">Describe who is reading the site (e.g. role, goals). Leave empty for a neutral visitor unless you enable inference below.</p>
+            <textarea id="content-check-persona" class="content-check-persona-input" rows="3" placeholder="e.g. A small-business owner comparing pricing before signing up…" spellcheck="true"></textarea>
+            <label class="content-check-infer-wrap">
+              <input type="checkbox" id="content-check-infer-persona" />
+              <span>Infer persona from the homepage</span>
+            </label>
+            <div class="content-check-actions">
+              <button type="button" class="btn-primary" id="btn-content-check-run">Run content check</button>
+            </div>
+            <p id="content-check-error" class="content-check-error hint error hidden" role="alert"></p>
+            <div id="content-check-results" class="content-check-results" aria-live="polite"></div>
+          </div>
+        </div>
       </div>
 
       <!-- Scenario detail view -->
@@ -197,7 +253,7 @@
         </section>
 
         <p class="hint" id="scenario-hint" style="display: none;"></p>
-        <section class="panel" aria-label="Scenario generation logs">
+        <section class="panel" id="panel-scenario-generation-logs" aria-label="Scenario generation logs" hidden>
           <p class="panel-label">Generation logs</p>
           <div id="scenario-build-logs" class="scenario-build-logs">
             <p class="run-idle">No generation logs yet.</p>
@@ -224,21 +280,62 @@
       <div id="view-site" class="view">
         <div class="view-header site-view-header">
           <div>
-            <h2 id="site-page-title">Site</h2>
+            <h2 id="site-page-title">Site dashboard</h2>
             <p class="view-sub" id="site-page-url"></p>
           </div>
           <div class="site-view-actions">
             <button type="button" class="btn-secondary" id="btn-site-share" title="Share read-only link">Share</button>
-            <button type="button" class="btn-secondary" id="btn-site-run-all" title="">Run all scenarios</button>
-            <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
           </div>
         </div>
-        <section class="site-section site-run-dashboard" id="site-run-dashboard" aria-live="polite">
-          <div class="site-run-dashboard-head">
-            <p class="panel-label">Run dashboard</p>
-            <p class="site-run-summary" id="site-run-summary"></p>
+        <div class="site-dashboard-grid" id="site-dashboard-grid">
+          <div class="site-dashboard-col">
+            <p class="site-dashboard-col-title">Scenarios</p>
+            <p class="hint site-dashboard-col-lead">Regression journeys for this site. Run all or open one to execute steps.</p>
+            <div class="site-scenario-col-actions">
+              <button type="button" class="btn-secondary" id="btn-site-run-all" title="">Run all scenarios</button>
+              <button class="btn-primary" id="btn-site-new-scenario">+ New scenario (AI)</button>
+            </div>
+            <section class="site-section site-run-dashboard" id="site-run-dashboard" aria-live="polite">
+              <div class="site-run-dashboard-head">
+                <p class="panel-label">Scenario runs</p>
+                <p class="site-run-summary" id="site-run-summary"></p>
+              </div>
+              <ul id="site-run-dashboard-list" class="site-run-dashboard-list"></ul>
+            </section>
+            <section class="site-section site-scenarios-list-section">
+              <ul id="site-scenario-list" class="site-scenario-list"></ul>
+            </section>
           </div>
-          <ul id="site-run-dashboard-list" class="site-run-dashboard-list"></ul>
+          <div class="site-dashboard-col" id="site-dashboard-content">
+            <p class="site-dashboard-col-title">Content</p>
+            <p class="hint site-dashboard-col-lead">Copy and UX read for a persona — advisory, not a pass/fail gate.</p>
+            <div class="site-preview-card panel site-dash-preview-card">
+              <p class="panel-label">Homepage we loaded</p>
+              <p class="site-preview-url" id="site-dash-content-preview-url"></p>
+              <h2 class="site-preview-title" id="site-dash-content-preview-title"></h2>
+              <p class="site-preview-headline" id="site-dash-content-preview-headline"></p>
+              <p class="site-preview-summary" id="site-dash-content-preview-summary"></p>
+              <p class="hint site-preview-auth-note" id="site-dash-content-preview-auth-note" hidden>This page may require sign-in. Use an auth profile below if needed.</p>
+            </div>
+            <div class="panel site-dash-content-panel">
+              <p class="panel-label">Persona and run</p>
+              <label class="content-check-label" for="site-dash-content-persona">Persona (optional)</label>
+              <p class="hint content-check-label-hint">Who is reading the site (role, goals). Leave empty for a neutral visitor unless you infer from the homepage.</p>
+              <textarea id="site-dash-content-persona" class="content-check-persona-input" rows="3" placeholder="e.g. A founder comparing plans before upgrade…" spellcheck="true"></textarea>
+              <label class="content-check-infer-wrap">
+                <input type="checkbox" id="site-dash-content-infer-persona" />
+                <span>Infer persona from the homepage</span>
+              </label>
+              <div class="content-check-actions">
+                <button type="button" class="btn-primary" id="btn-site-dash-content-run">Run content check</button>
+              </div>
+              <p id="site-dash-content-error" class="content-check-error hint error hidden" role="alert"></p>
+              <div id="site-dash-content-results" class="content-check-results" aria-live="polite"></div>
+            </div>
+          </div>
+        </div>
+        <section class="site-section site-explore-section hidden" id="site-explore-section" aria-label="Explored content from discovery">
+          <div id="site-explore-inner"></div>
         </section>
         <section class="edit-scenario site-create-scenario hidden" id="site-create-scenario-panel" aria-label="Create scenario with AI">
           <label class="edit-scenario-label" for="site-create-prompt">Create scenario</label>
@@ -253,10 +350,6 @@
             <input type="url" id="site-create-starting-webpage" class="starting-webpage-input" placeholder="" spellcheck="false" />
           </div>
           <p class="hint" id="site-create-hint" style="display: none;"></p>
-        </section>
-        <section class="site-section">
-          <p class="panel-label">Scenarios</p>
-          <ul id="site-scenario-list" class="site-scenario-list"></ul>
         </section>
         <section class="site-section">
           <p class="panel-label">Auth profiles for this site</p>
@@ -298,6 +391,14 @@
             <p class="view-sub" id="account-email"></p>
           </div>
         </div>
+        <section class="panel account-preferences-panel">
+          <p class="panel-label">Preferences</p>
+          <label class="account-pref-row">
+            <input type="checkbox" id="account-advanced-view" />
+            <span>Advanced view</span>
+          </label>
+          <p class="hint account-pref-hint">When enabled, shows <strong>Generation logs</strong> on scenario detail, and on discovery / site explore: <strong>Discovery full log</strong> and <strong>Visited pages</strong>.</p>
+        </section>
         <section class="panel account-usage-panel">
           <p class="panel-label">Scenario runs this month (UTC)</p>
           <p id="account-usage-line" class="account-usage-line">—</p>

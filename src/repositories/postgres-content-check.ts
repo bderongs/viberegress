@@ -1,8 +1,8 @@
 /**
- * Postgres implementation of DiscoveryRepository.
+ * Postgres implementation of ContentCheckRepository.
  */
 
-import type { DiscoveryRepository, DiscoveryRecord } from './interfaces.js';
+import type { ContentCheckRepository, ContentCheckRecord } from './interfaces.js';
 import type { Owner } from '../types/owner.js';
 import { getPgPool } from '../lib/postgres.js';
 
@@ -11,7 +11,7 @@ function ownerDb(owner: Owner): { ownerType: string; ownerId: string } {
   return { ownerType: 'anonymous', ownerId: owner.id };
 }
 
-interface DiscoveryRow {
+interface ContentCheckRow {
   id: string;
   site_url: string;
   status: string;
@@ -21,11 +21,11 @@ interface DiscoveryRow {
   completed_at: string | null;
 }
 
-function rowToRecord(row: DiscoveryRow): DiscoveryRecord {
+function rowToRecord(row: ContentCheckRow): ContentCheckRecord {
   return {
     id: row.id,
     siteUrl: row.site_url,
-    status: row.status as DiscoveryRecord['status'],
+    status: row.status as ContentCheckRecord['status'],
     inputJson: row.input_json,
     resultJson: row.result_json,
     createdAt: row.created_at,
@@ -33,14 +33,14 @@ function rowToRecord(row: DiscoveryRow): DiscoveryRecord {
   };
 }
 
-export function createDiscoveryRepository(): DiscoveryRepository {
+export function createContentCheckRepository(): ContentCheckRepository {
   const pool = getPgPool();
 
   return {
-    async save(record: DiscoveryRecord, owner: Owner): Promise<void> {
+    async save(record: ContentCheckRecord, owner: Owner): Promise<void> {
       const { ownerType, ownerId } = ownerDb(owner);
       await pool.query(
-        `INSERT INTO discoveries (
+        `INSERT INTO content_checks (
           id, site_url, status, input_json, result_json, created_at, completed_at,
           owner_type, owner_id
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
@@ -67,10 +67,10 @@ export function createDiscoveryRepository(): DiscoveryRepository {
       );
     },
 
-    async getById(id: string, owner: Owner): Promise<DiscoveryRecord | undefined> {
+    async getById(id: string, owner: Owner): Promise<ContentCheckRecord | undefined> {
       const { ownerType, ownerId } = ownerDb(owner);
-      const result = await pool.query<DiscoveryRow>(
-        `SELECT * FROM discoveries WHERE id = $1 AND owner_type = $2 AND owner_id = $3`,
+      const result = await pool.query<ContentCheckRow>(
+        `SELECT * FROM content_checks WHERE id = $1 AND owner_type = $2 AND owner_id = $3`,
         [id, ownerType, ownerId]
       );
       return result.rows[0] ? rowToRecord(result.rows[0]) : undefined;
@@ -79,12 +79,12 @@ export function createDiscoveryRepository(): DiscoveryRepository {
     async listByOwner(
       owner: Owner,
       options?: { siteUrl?: string; limit?: number }
-    ): Promise<DiscoveryRecord[]> {
+    ): Promise<ContentCheckRecord[]> {
       const { ownerType, ownerId } = ownerDb(owner);
       const limit = Math.min(100, Math.max(1, options?.limit ?? 50));
       const site = options?.siteUrl?.trim() || null;
-      const result = await pool.query<DiscoveryRow>(
-        `SELECT * FROM discoveries
+      const result = await pool.query<ContentCheckRow>(
+        `SELECT * FROM content_checks
          WHERE owner_type = $1 AND owner_id = $2
          AND ($3::text IS NULL OR site_url = $3)
          ORDER BY created_at DESC
@@ -97,26 +97,26 @@ export function createDiscoveryRepository(): DiscoveryRepository {
     async updateStatus(
       id: string,
       owner: Owner,
-      status: DiscoveryRecord['status'],
+      status: ContentCheckRecord['status'],
       resultJson?: string | null,
       completedAt?: string
     ): Promise<void> {
       const { ownerType, ownerId } = ownerDb(owner);
       if (resultJson !== undefined && completedAt !== undefined) {
         await pool.query(
-          `UPDATE discoveries SET status = $1, result_json = $2, completed_at = $3
+          `UPDATE content_checks SET status = $1, result_json = $2, completed_at = $3
            WHERE id = $4 AND owner_type = $5 AND owner_id = $6`,
           [status, resultJson, completedAt, id, ownerType, ownerId]
         );
       } else if (completedAt !== undefined) {
         await pool.query(
-          `UPDATE discoveries SET status = $1, completed_at = $2
+          `UPDATE content_checks SET status = $1, completed_at = $2
            WHERE id = $3 AND owner_type = $4 AND owner_id = $5`,
           [status, completedAt, id, ownerType, ownerId]
         );
       } else {
         await pool.query(
-          `UPDATE discoveries SET status = $1 WHERE id = $2 AND owner_type = $3 AND owner_id = $4`,
+          `UPDATE content_checks SET status = $1 WHERE id = $2 AND owner_type = $3 AND owner_id = $4`,
           [status, id, ownerType, ownerId]
         );
       }
