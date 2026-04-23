@@ -55,6 +55,45 @@ export interface ModifyScenarioStepResult {
   type: Step['type'];
 }
 
+function rewriteExampleUrlsToSite(urlText: string, siteUrl: string): string {
+  const s = (urlText || '').trim();
+  if (!s) return urlText;
+  let siteOrigin: string;
+  try {
+    siteOrigin = new URL(siteUrl).origin;
+  } catch {
+    return urlText;
+  }
+
+  // Replace any fully-qualified URL that uses placeholder "example" domains with the real site origin.
+  // This is a guardrail against LLMs rewriting user-provided domains to reserved examples.
+  return s.replace(/https?:\/\/[^\s)"']+/g, (match) => {
+    let u: URL;
+    try {
+      u = new URL(match);
+    } catch {
+      return match;
+    }
+
+    const h = (u.hostname || '').toLowerCase();
+    const isExampleHost =
+      h === 'example.com' ||
+      h.endsWith('.example.com') ||
+      h === 'example' ||
+      h.endsWith('.example');
+    if (!isExampleHost) return match;
+
+    return `${siteOrigin}${u.pathname || ''}${u.search || ''}${u.hash || ''}`;
+  });
+}
+
+function rewriteExampleUrlsInSteps<T extends { instruction: string }>(
+  steps: T[],
+  siteUrl: string
+): T[] {
+  return steps.map((s) => ({ ...s, instruction: rewriteExampleUrlsToSite(s.instruction, siteUrl) }));
+}
+
 function buildPreRunInstruction(scenario: Scenario, userMessage: string, narrativeBlock: string): string {
   return `You are modifying a test scenario according to the user's request. Apply exactly what they ask (e.g. remove a step, change text, reorder).
 
@@ -70,6 +109,7 @@ User request: "${userMessage}"
 
 Rules:
 - Do what the user asked. If they say "don't do that step" or "remove step X", remove it. If they want different text or order, apply that.
+- URL integrity: Do NOT rewrite or "anonymize" domains (do not turn real domains into *.example). If you include any URL in a step, keep the real site domain from the scenario's Site URL.
 - Each step must remain a plain English instruction. Any step that involves typing MUST include the exact text in quotes (e.g. Type "pricing" in the search box).
 - Keep steps atomic: each step should express one primary intent.
 - When a request combines multiple intents (for example action + verification), split it into separate ordered steps.
@@ -115,6 +155,7 @@ User request: "${userMessage}"
 
 Rules:
 - Do what the user asked (e.g. "don't do that step", "fix the step that failed", "use a different search term").
+- URL integrity: Do NOT rewrite or "anonymize" domains (do not turn real domains into *.example). If you include any URL in a step, keep the real site domain from the scenario's Site URL.
 - Each step must be a plain English instruction. Any step that involves typing MUST include the exact text in quotes.
 - Keep steps atomic: each step should express one primary intent.
 - When a request combines multiple intents (for example action + verification), split it into separate ordered steps.
@@ -133,6 +174,7 @@ ${narrativeBlock}
 
 Rules:
 - Create a short scenario name and description that match the request.
+- URL integrity: Do NOT rewrite or "anonymize" domains (do not turn real domains into *.example). If you include any URL in a step, it must stay on the same site domain as the Site URL above.
 - Steps must be plain English instructions. Any step that involves typing MUST include the exact text in quotes (e.g. Type "pricing" in the search box).
 - Use a small number of steps (typically 3–8) that a browser could execute: navigate, click, type, assert text or visibility.
 - Follow the page narrative above for the primary user journey on this URL; do not add steps that interact with demo or decorative sections listed above unless the user explicitly asks to test those.
@@ -160,6 +202,7 @@ User request: "${userMessage}"
 
 Rules:
 - Edit only step ${stepIndex + 1}. Do not add/remove/reorder steps.
+- URL integrity: Do NOT rewrite or "anonymize" domains (do not turn real domains into *.example). If you include any URL in the step, keep the real site domain from the scenario's siteUrl.
 - Return only the updated instruction text for that step.
 - Use plain English.
 - If the step involves typing, include exact typed text in quotes (e.g. Type "pricing" in the search box).`;
@@ -247,6 +290,7 @@ export async function modifyScenarioWithAI(input: ModifyScenarioInput): Promise<
     });
 
     const result = parseAndValidateModifyResult(raw);
+    result.steps = rewriteExampleUrlsInSteps(result.steps, scenario.siteUrl);
     logger.info('scenario_modify_success', { scenarioId: scenario.id, mode, stepCount: result.steps.length });
     return { ...result, pageStory };
   } catch (err) {
@@ -304,6 +348,7 @@ export async function createScenarioFromPrompt(
     });
 
     const result = parseAndValidateModifyResult(raw);
+    result.steps = rewriteExampleUrlsInSteps(result.steps, siteUrl);
     logger.info('scenario_create_from_prompt_success', { siteUrl, stepCount: result.steps.length });
     return { ...result, pageStory };
   } catch (err) {
@@ -356,8 +401,9 @@ export async function modifyScenarioStepWithAI(
     }
 
     const cleaned = cleanInstruction(parsed.data.instruction);
-    const inferredType = inferStepType(cleaned);
-    const validated = validateAndNormalizeSteps([{ instruction: cleaned, type: inferredType }], {
+    const withFixedUrls = rewriteExampleUrlsToSite(cleaned, scenario.siteUrl);
+    const inferredType = inferStepType(withFixedUrls);
+    const validated = validateAndNormalizeSteps([{ instruction: withFixedUrls, type: inferredType }], {
       name: scenario.name,
       description: scenario.description,
     });

@@ -87,6 +87,16 @@ export interface SitePreviewResult {
   mainHeadline: string;
   summary: string;
   requireAuth: boolean;
+  /** Best-effort inferred primary audience for the homepage messaging. */
+  likelyTargetPersona?: string;
+  /** How we got `likelyTargetPersona` (UI can show tags/controls). */
+  likelyTargetPersonaSource?: 'auto' | 'edited';
+  /** User explicitly accepted the auto-detected persona (welcome flow). */
+  likelyTargetPersonaValidated?: boolean;
+  /** 0–1; confidence for auto inference when available. */
+  likelyTargetPersonaConfidence?: number;
+  /** Best-effort inferred frontend/CMS stack from page signals. */
+  likelyTechnologyStack?: string;
 }
 
 export interface DiscoveryResult {
@@ -239,7 +249,12 @@ export type DiscoveryEventPayload =
       durationMs: number;
       crawlErrorCount?: number;
     }
-  | { eventType: 'content_check_failed'; siteUrl: string; error: string };
+  | { eventType: 'content_check_failed'; siteUrl: string; error: string }
+  | {
+      eventType: 'site_deleted';
+      siteUrl: string;
+      deleted: { scenarios: number; discoveries: number; contentChecks: number; shareLinks: number };
+    };
 
 /** Scenario build/save flow event payloads */
 export interface ScenarioRepairTrace {

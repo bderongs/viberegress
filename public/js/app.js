@@ -235,6 +235,22 @@ function shouldPersistScanSession() {
 function syncSiteSessionFromUi() {
   const key = getCurrentScanSiteKey();
   if (!key || !shouldPersistScanSession()) return;
+  const uiStep = readWelcomeUiStep();
+  const existingSession = getSiteSession(key);
+  const hasScanProgress =
+    !!sitePreviewResult ||
+    !!discoveredScenarios ||
+    !!contentCheckResult ||
+    (existingSession &&
+      (existingSession.preview ||
+        existingSession.discoveryResult ||
+        existingSession.contentCheckResult ||
+        existingSession.uiStep === 'choose' ||
+        existingSession.uiStep === 'discovery' ||
+        existingSession.uiStep === 'content' ||
+        existingSession.uiStep === 'site'));
+  // Avoid creating sidebar site entries while the user is only typing in the URL field.
+  if (!existingSession && uiStep === 'url' && !hasScanProgress) return;
   activeSiteSessionKey = key;
   const siteUrl =
     normalizeUrlInput(($('scan-url') && $('scan-url').value.trim()) || '') ||
@@ -246,7 +262,7 @@ function syncSiteSessionFromUi() {
     headless: $('scan-headless') ? $('scan-headless').checked : true,
     authProfileId: ($('scan-auth-profile') && $('scan-auth-profile').value) || '',
     preview: sitePreviewResult,
-    uiStep: readWelcomeUiStep(),
+    uiStep,
     discoveryResult: discoveredScenarios,
     contentCheckResult,
     contentCheckInput: readContentCheckInputFromUi(),
@@ -427,6 +443,14 @@ function fillSitePreviewIntoDom(prefix, preview) {
   const titleEl = $(`${prefix}-title`);
   const headlineEl = $(`${prefix}-headline`);
   const summaryEl = $(`${prefix}-summary`);
+  const personaCardEl = $(`${prefix}-persona-card`);
+  const personaEl = $(`${prefix}-target-persona`);
+  const personaAutoTagEl = $(`${prefix}-persona-tag-auto`);
+  const personaValidatedTagEl = $(`${prefix}-persona-tag-validated`);
+  const personaInlineActionsEl = $(`${prefix}-persona-inline-actions`);
+  const personaValidateBtnEl = $('btn-persona-validate');
+  const personaEditBtnEl = $('btn-persona-edit');
+  const stackEl = $(`${prefix}-tech-stack`);
   const authEl = $(`${prefix}-auth-note`);
   if (urlEl) urlEl.textContent = preview.resolvedUrl || preview.siteUrl || '';
   if (titleEl) titleEl.textContent = preview.title || 'Untitled page';
@@ -442,6 +466,32 @@ function fillSitePreviewIntoDom(prefix, preview) {
     }
   }
   if (summaryEl) summaryEl.textContent = preview.summary || '';
+  const persona = (preview.likelyTargetPersona || '').trim();
+  const stack = (preview.likelyTechnologyStack || '').trim();
+  const personaSource = preview.likelyTargetPersonaSource || 'auto';
+  const personaValidated = preview.likelyTargetPersonaValidated === true;
+  if (personaEl) {
+    if (persona) {
+      personaEl.textContent = persona;
+    } else {
+      personaEl.textContent = '';
+    }
+  }
+  if (personaAutoTagEl) personaAutoTagEl.hidden = !(persona && personaSource === 'auto' && !personaValidated);
+  if (personaValidatedTagEl) personaValidatedTagEl.hidden = !(persona && personaSource === 'auto' && personaValidated);
+  if (personaValidateBtnEl) personaValidateBtnEl.hidden = !(persona && personaSource === 'auto' && !personaValidated);
+  if (personaEditBtnEl) personaEditBtnEl.hidden = !(persona && personaSource === 'auto');
+  if (personaInlineActionsEl) personaInlineActionsEl.hidden = !(persona && personaSource === 'auto');
+  if (stackEl) {
+    if (stack) {
+      stackEl.textContent = 'Tech stack (best guess): ' + stack;
+      stackEl.hidden = false;
+    } else {
+      stackEl.textContent = '';
+      stackEl.hidden = true;
+    }
+  }
+  if (personaCardEl) personaCardEl.hidden = !persona;
   if (authEl) authEl.hidden = !preview.requireAuth;
 }
 
@@ -1054,6 +1104,72 @@ document.addEventListener('click', (e) => {
     });
 });
 
+function initWelcomePersonaCardUi() {
+  const btnValidate = $('btn-persona-validate');
+  const btnEdit = $('btn-persona-edit');
+  const btnCancel = $('btn-persona-cancel');
+  const btnSave = $('btn-persona-save');
+  const editWrap = $('site-preview-persona-edit');
+  const viewWrap = $('site-preview-persona-view');
+  const inputEl = $('site-preview-persona-input');
+
+  if (btnValidate) {
+    btnValidate.addEventListener('click', () => {
+      const persona = (sitePreviewResult && sitePreviewResult.likelyTargetPersona ? String(sitePreviewResult.likelyTargetPersona) : '').trim();
+      if (!persona) return;
+      if (sitePreviewResult && typeof sitePreviewResult === 'object') {
+        sitePreviewResult.likelyTargetPersonaValidated = true;
+        if (!sitePreviewResult.likelyTargetPersonaSource) sitePreviewResult.likelyTargetPersonaSource = 'auto';
+      }
+      mirrorContentCheckInputsAcrossPanels({ persona, inferPersona: false });
+      fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+      syncSiteSessionFromUi();
+      // Lightweight UI feedback: disable inference toggles since a persona is now set.
+      const i1 = $('content-check-infer-persona');
+      const i2 = $('site-dash-content-infer-persona');
+      if (i1) i1.checked = false;
+      if (i2) i2.checked = false;
+    });
+  }
+
+  const enterEditMode = () => {
+    if (!editWrap || !viewWrap || !inputEl) return;
+    const current = (sitePreviewResult && sitePreviewResult.likelyTargetPersona ? String(sitePreviewResult.likelyTargetPersona) : '').trim();
+    inputEl.value = current;
+    viewWrap.classList.add('hidden');
+    editWrap.classList.remove('hidden');
+    inputEl.focus();
+  };
+
+  const exitEditMode = () => {
+    if (!editWrap || !viewWrap) return;
+    editWrap.classList.add('hidden');
+    viewWrap.classList.remove('hidden');
+  };
+
+  if (btnEdit) {
+    btnEdit.addEventListener('click', () => {
+      enterEditMode();
+    });
+  }
+
+  if (btnCancel) btnCancel.addEventListener('click', () => exitEditMode());
+
+  if (btnSave) {
+    btnSave.addEventListener('click', () => {
+      const next = (inputEl && inputEl.value ? String(inputEl.value) : '').trim();
+      if (!next) return;
+      if (!sitePreviewResult || typeof sitePreviewResult !== 'object') return;
+      sitePreviewResult.likelyTargetPersona = next;
+      sitePreviewResult.likelyTargetPersonaSource = 'edited';
+      sitePreviewResult.likelyTargetPersonaValidated = false;
+      fillSitePreviewIntoDom('site-preview', sitePreviewResult);
+      syncSiteSessionFromUi();
+      exitEditMode();
+    });
+  }
+}
+
 async function loadAccountView() {
   const advEl = $('account-advanced-view');
   if (advEl) advEl.checked = isAdvancedView();
@@ -1220,6 +1336,7 @@ function openShareModal() {
 
 function bindShareUi() {
   $('btn-site-share')?.addEventListener('click', () => openShareModal());
+  $('btn-site-delete')?.addEventListener('click', () => void deleteSelectedSiteWorkspace());
   $('share-modal-close')?.addEventListener('click', closeShareModal);
   $('share-overlay')?.addEventListener('click', e => {
     if (e.target.id === 'share-overlay') closeShareModal();
@@ -1237,6 +1354,51 @@ function bindShareUi() {
       if (hint) hint.textContent = e.message || 'Could not create link';
     }
   });
+}
+
+async function deleteSelectedSiteWorkspace() {
+  if (!selectedSiteUrl) return;
+  const siteUrl = selectedSiteUrl;
+  const siteScenarioCount = scenarios.filter(s => (s.siteUrl || '') === siteUrl).length;
+  const key = normalizeSiteKey(siteUrl);
+
+  const msg =
+    `Delete this site workspace?\n\n` +
+    `This will delete:\n` +
+    `- ${siteScenarioCount} saved scenario(s) for ${siteUrl}\n` +
+    `- all their runs/artifacts\n` +
+    `- discovery + content-check history for this site\n` +
+    `- any share links for this site\n\n` +
+    `This cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  showOverlay('Deleting site…');
+  try {
+    await api('DELETE', '/sites/' + encodeURIComponent(siteUrl));
+    deleteSiteSession(key);
+    if (activeSiteSessionKey === key) activeSiteSessionKey = null;
+    try {
+      const last = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
+      if (last === key) localStorage.removeItem(LAST_ACTIVE_SITE_KEY);
+    } catch (_) {}
+
+    if (activeScenarioId && scenarios.some(s => s.id === activeScenarioId && (s.siteUrl || '') === siteUrl)) {
+      activeScenarioId = null;
+    }
+    if (selectedSiteUrl === siteUrl) selectedSiteUrl = null;
+
+    await loadScenarios();
+    renderSidebarList();
+
+    if (!tryRestoreLastSiteSession()) {
+      resetWelcomeToUrlStep();
+      showView('welcome');
+    }
+  } catch (err) {
+    alert('Failed to delete site: ' + err.message);
+  } finally {
+    hideOverlay();
+  }
 }
 
 function bindSharedVisitorUi() {
@@ -1769,6 +1931,7 @@ function renderSidebarList() {
           <span class="site-hostname site-open-link" role="button" tabindex="0" onclick="event.stopPropagation(); activateSiteWorkspace('${esc(displayUrl)}', true)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();activateSiteWorkspace('${esc(displayUrl)}', true)}">${escapeHtml(hostname)}</span>
           ${inProgress && !items.length ? '<span class="site-draft-badge" title="Scan in progress">···</span>' : ''}
           <span class="site-count">${items.length}</span>
+          <button type="button" class="site-delete-btn" title="Delete site workspace" onclick="event.stopPropagation(); deleteSiteWorkspace('${esc(displayUrl)}')">×</button>
         </div>
         ${isOpen ? `<ul class="site-scenarios">
           ${
@@ -1790,6 +1953,63 @@ function renderSidebarList() {
   }
 
   ul.innerHTML = html;
+}
+
+async function deleteSiteWorkspace(siteUrl) {
+  if (!siteUrl) return;
+  const siteScenarioCount = scenarios.filter(s => (s.siteUrl || '') === siteUrl).length;
+  const key = normalizeSiteKey(siteUrl);
+
+  const msg =
+    `Delete this site workspace?\n\n` +
+    `This will delete:\n` +
+    `- ${siteScenarioCount} saved scenario(s) for ${siteUrl}\n` +
+    `- all their runs/artifacts\n` +
+    `- discovery + content-check history for this site\n` +
+    `- any share links for this site\n\n` +
+    `This cannot be undone.`;
+  if (!confirm(msg)) return;
+
+  showOverlay('Deleting site…');
+  try {
+    await api('DELETE', '/sites/' + encodeURIComponent(siteUrl));
+
+    deleteSiteSession(key);
+    if (activeSiteSessionKey === key) activeSiteSessionKey = null;
+    try {
+      const last = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
+      if (last === key) localStorage.removeItem(LAST_ACTIVE_SITE_KEY);
+    } catch (_) {}
+
+    if (activeScenarioId && scenarios.some(s => s.id === activeScenarioId && (s.siteUrl || '') === siteUrl)) {
+      activeScenarioId = null;
+    }
+    if (selectedSiteUrl === siteUrl) selectedSiteUrl = null;
+
+    await loadScenarios();
+    renderSidebarList();
+
+    if (views.site && views.site.classList.contains('active')) {
+      if (!tryRestoreLastSiteSession()) {
+        resetWelcomeToUrlStep();
+        showView('welcome');
+      }
+    } else if (
+      (views.welcome && views.welcome.classList.contains('active')) ||
+      (views.discovery && views.discovery.classList.contains('active')) ||
+      (views.contentCheck && views.contentCheck.classList.contains('active'))
+    ) {
+      const currentKey = getCurrentScanSiteKey();
+      if (currentKey && currentKey === key) {
+        resetWelcomeToUrlStep();
+        showView('welcome');
+      }
+    }
+  } catch (err) {
+    alert('Failed to delete site: ' + err.message);
+  } finally {
+    hideOverlay();
+  }
 }
 
 function openSite(siteUrl, options = {}) {
@@ -2840,7 +3060,8 @@ function buildDiscoveryExplorePanelsHtml(result, sess, scenariosForLogFallback, 
     `
     : '';
 
-  const traceHtml = intentTraces.length
+  const traceHtml =
+    showDiagnostics && intentTraces.length
     ? `
       <div class="discovery-traces panel">
         <p class="panel-label">How discovered (${intentTraces.length})</p>
@@ -4230,6 +4451,7 @@ const RUN_HEADLESS_KEY = 'viberegress_run_headless';
   bindAuthUi();
   bindAccountUi();
   bindShareUi();
+  initWelcomePersonaCardUi();
   const pathToken = parseSharePath();
   if (pathToken) {
     const appEl = document.getElementById('app');

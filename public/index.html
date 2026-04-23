@@ -123,7 +123,38 @@
               <h2 class="site-preview-title" id="site-preview-title"></h2>
               <p class="site-preview-headline" id="site-preview-headline"></p>
               <p class="site-preview-summary" id="site-preview-summary"></p>
+              <p class="site-preview-tech-info" id="site-preview-tech-stack" hidden></p>
               <p class="hint site-preview-auth-note" id="site-preview-auth-note" hidden>This page may require sign-in. Use an auth profile if you haven’t already.</p>
+            </div>
+            <div class="site-preview-persona-card panel" id="site-preview-persona-card" hidden>
+              <div class="site-preview-persona-head">
+                <div>
+                  <p class="site-preview-persona-eyebrow">MAIN PERSONA</p>
+                  <div class="site-preview-persona-tags">
+                    <span class="tag tag-muted" id="site-preview-persona-tag-auto" hidden>auto-detect</span>
+                    <span class="tag tag-validated" id="site-preview-persona-tag-validated" hidden>validated</span>
+                    <div class="site-preview-persona-inline-actions" id="site-preview-persona-inline-actions" hidden>
+                      <button type="button" class="pill-btn pill-validate" id="btn-persona-validate" title="Validate persona">
+                        Validate
+                      </button>
+                      <button type="button" class="pill-btn pill-edit" id="btn-persona-edit" title="Edit persona">
+                        <span class="pill-icon" aria-hidden="true">✎</span>
+                        Edit
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div id="site-preview-persona-view">
+                <p class="site-preview-persona-value" id="site-preview-target-persona"></p>
+              </div>
+              <div id="site-preview-persona-edit" class="persona-edit hidden">
+                <textarea id="site-preview-persona-input" class="persona-edit-input" rows="3"></textarea>
+                <div class="persona-edit-actions">
+                  <button type="button" class="btn-secondary btn-sm" id="btn-persona-cancel">Cancel</button>
+                  <button type="button" class="btn-primary btn-sm" id="btn-persona-save">Save persona</button>
+                </div>
+              </div>
             </div>
             <p class="welcome-choose-prompt">What would you like to do next?</p>
             <div class="welcome-choose-actions">
@@ -285,6 +316,7 @@
           </div>
           <div class="site-view-actions">
             <button type="button" class="btn-secondary" id="btn-site-share" title="Share read-only link">Share</button>
+            <button type="button" class="btn-danger" id="btn-site-delete" title="Delete this site and all its scenarios">Delete site</button>
           </div>
         </div>
         <div class="site-dashboard-grid" id="site-dashboard-grid">
@@ -397,7 +429,7 @@
             <input type="checkbox" id="account-advanced-view" />
             <span>Advanced view</span>
           </label>
-          <p class="hint account-pref-hint">When enabled, shows <strong>Generation logs</strong> on scenario detail, and on discovery / site explore: <strong>Discovery full log</strong> and <strong>Visited pages</strong>.</p>
+          <p class="hint account-pref-hint">When enabled, shows <strong>Generation logs</strong> on scenario detail, and on discovery / site explore: <strong>Discovery full log</strong>, <strong>Visited pages</strong>, and <strong>How discovered</strong>.</p>
         </section>
         <section class="panel account-usage-panel">
           <p class="panel-label">Scenario runs this month (UTC)</p>

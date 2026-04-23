@@ -889,11 +889,12 @@ function buildScenarioDescription(input: {
 async function summarizeCurrentPage(
   page: {
     extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
+    url: () => string;
   }
 ): Promise<DiscoveryPageSummaryRaw> {
-  return await page.extract({
+  const raw = await page.extract({
     instruction: `Summarize this current page for scenario discovery.
-- Return current URL.
+- url: if unsure, return an empty string (the system will read the real browser URL).
 - Return a concise title or primary heading.
 - Return a short summary (1-2 sentences).
 - Return up to 5 visible heading signals.
@@ -907,6 +908,16 @@ Keep output factual and grounded in visible page content only. Do not invent fie
     schema: discoveryPageSummarySchema,
     iframes: true,
   });
+  try {
+    const actual = page.url();
+    const u = new URL(actual);
+    if (u.protocol === 'http:' || u.protocol === 'https:') {
+      raw.url = u.href;
+    }
+  } catch {
+    // ignore URL parse errors; keep model-provided raw.url
+  }
+  return raw;
 }
 
 async function extractIntentCandidates(
@@ -1118,6 +1129,7 @@ async function traceJourneyFromIntent(
       observed = await summarizeCurrentPage(
         page as unknown as {
           extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
+          url: () => string;
         }
       );
       recordDebugEvent({
@@ -1882,8 +1894,14 @@ export async function previewSite(
 
   try {
     await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const raw = await summarizeCurrentPage(page as unknown as {
+    const pwPage = page as unknown as {
+      extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<unknown>;
+      evaluate: <T>(pageFunction: () => T | Promise<T>) => Promise<T>;
+      url: () => string;
+    };
+    const raw = await summarizeCurrentPage(pwPage as unknown as {
       extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
+      url: () => string;
     });
     const resolvedUrl = raw.url || siteUrl;
     const title = raw.title || '';
@@ -1891,6 +1909,8 @@ export async function previewSite(
       raw.headingSignals && raw.headingSignals.length > 0 && String(raw.headingSignals[0]).trim()
         ? String(raw.headingSignals[0]).trim()
         : title;
+    const personaInfer = await inferLikelyTargetPersonaAi(pwPage);
+    const likelyTechnologyStack = await inferLikelyTechnologyStack(pwPage);
     return {
       siteUrl,
       resolvedUrl,
@@ -1898,10 +1918,102 @@ export async function previewSite(
       mainHeadline,
       summary: raw.summary || '',
       requireAuth: isLikelyAuthDestination(resolvedUrl, title, raw.summary || ''),
+      likelyTargetPersona: personaInfer.persona,
+      likelyTargetPersonaSource: personaInfer.source,
+      likelyTargetPersonaValidated: false,
+      likelyTargetPersonaConfidence: personaInfer.confidence,
+      likelyTechnologyStack,
     };
   } finally {
     await stagehand.close();
   }
+}
+
+async function inferLikelyTargetPersonaAi(page: {
+  extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<unknown>;
+}): Promise<{ persona: string; source: 'auto'; confidence?: number }> {
+  const fallback = 'Could not confidently infer a specific persona from the homepage';
+  try {
+    const inferred = (await page.extract({
+      instruction:
+        `Considering only what is visible on this homepage (wording, positioning, calls-to-action, feature framing, tone), ` +
+        `infer the SINGLE most likely primary target persona the site is written for. ` +
+        `Be specific: role + context + intent. ` +
+        `Return a short label plus 1 sentence describing their goal (prefer the page language when possible). ` +
+        `Avoid "everyone" unless the page is truly broad/ambiguous. ` +
+        `Return confidence 0-1.`,
+      schema: z.object({
+        persona: z.string(),
+        confidence: z.number(),
+      }),
+      iframes: true,
+    })) as { persona: string; confidence: number };
+    const persona = (inferred.persona || '').trim();
+    const conf =
+      typeof inferred.confidence === 'number' && inferred.confidence >= 0 && inferred.confidence <= 1
+        ? inferred.confidence
+        : undefined;
+    return { persona: persona || fallback, source: 'auto', confidence: conf };
+  } catch {
+    return { persona: fallback, source: 'auto', confidence: undefined };
+  }
+}
+
+async function inferLikelyTechnologyStack(page: {
+  url: () => string;
+  evaluate: <T>(pageFunction: () => T | Promise<T>) => Promise<T>;
+}): Promise<string> {
+  let signals: string[] = [];
+  try {
+    signals = await page.evaluate(() => {
+      const found: string[] = [];
+      const html = document.documentElement ? document.documentElement.innerHTML : '';
+      const scripts = Array.from(document.querySelectorAll('script[src]'))
+        .map((s) => (s.getAttribute('src') || '').toLowerCase())
+        .join('\n');
+      const metas = Array.from(document.querySelectorAll('meta[name],meta[property]')).map((m) => ({
+        name: (m.getAttribute('name') || '').toLowerCase(),
+        property: (m.getAttribute('property') || '').toLowerCase(),
+        content: (m.getAttribute('content') || '').toLowerCase(),
+      }));
+
+      const push = (name: string) => {
+        if (!found.includes(name)) found.push(name);
+      };
+
+      if ((window as any).__NEXT_DATA__ || /_next\//i.test(scripts)) push('nextjs');
+      if (/wp-content|wp-includes/i.test(html) || metas.some((m) => m.name === 'generator' && /wordpress/i.test(m.content))) push('wordpress');
+      if (/cdn\.shopify\.com|shopify/i.test(html) || metas.some((m) => m.name === 'shopify-checkout-api-token')) push('shopify');
+      if (/wixstatic\.com|_wix/i.test(html)) push('wix');
+      if (/squarespace/i.test(html) || scripts.includes('static.squarespace.com')) push('squarespace');
+      if (/webflow/i.test(html) || scripts.includes('webflow')) push('webflow');
+      if ((window as any).React || /react/i.test(scripts)) push('react');
+      if ((window as any).Vue || /vue/i.test(scripts)) push('vue');
+      if ((window as any).angular || /angular/i.test(scripts)) push('angular');
+      if (/cdn\.jsdelivr\.net\/npm\/tailwindcss|tailwind/i.test(html)) push('tailwind');
+      return found;
+    });
+  } catch {
+    // Best-effort only.
+  }
+
+  if (signals.includes('shopify')) return 'Shopify storefront';
+  if (signals.includes('wordpress')) return 'WordPress CMS';
+  if (signals.includes('wix')) return 'Wix site builder';
+  if (signals.includes('squarespace')) return 'Squarespace site builder';
+  if (signals.includes('webflow')) return 'Webflow site builder';
+  if (signals.includes('nextjs')) return 'Next.js + React';
+  if (signals.includes('react')) return 'React-based frontend';
+  if (signals.includes('vue')) return 'Vue-based frontend';
+  if (signals.includes('angular')) return 'Angular-based frontend';
+
+  try {
+    const host = new URL(page.url()).hostname.toLowerCase();
+    if (host.endsWith('myshopify.com')) return 'Shopify storefront';
+  } catch {
+    // Ignore parse issues.
+  }
+  return 'No clear framework detected (likely custom stack)';
 }
 
 const CONTENT_CHECK_MAX_MS = 90_000;
@@ -2054,8 +2166,9 @@ export async function runContentCheck(
     extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<unknown>;
     goto: (url: string, opts?: { waitUntil?: 'domcontentloaded'; timeout?: number }) => Promise<unknown>;
     evaluate: (fn: (origin: string) => unknown, arg: string) => Promise<unknown>;
+    url: () => string;
   };
-  const summarizeHost = pwPage as Parameters<typeof summarizeCurrentPage>[0];
+  const summarizeHost = pwPage as unknown as Parameters<typeof summarizeCurrentPage>[0];
 
   try {
     await page.goto(siteUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -2247,6 +2360,7 @@ export async function discoverScenarios(
 
     const home = await summarizeCurrentPage(page as unknown as {
       extract: (input: { instruction: string; schema: z.ZodTypeAny; iframes?: boolean }) => Promise<DiscoveryPageSummaryRaw>;
+      url: () => string;
     });
     appendCrawlSnapshot(crawlPageSnapshots, home, 'home');
     visitedPages.push({

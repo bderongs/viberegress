@@ -38,6 +38,7 @@ import { parseCookiesFromDevTools } from '../lib/parse-devtools-cookies.js';
 import { validateStartingWebpage } from '../lib/starting-webpage.js';
 import { authMiddleware } from '../middleware/auth.js';
 import type { Owner } from '../types/owner.js';
+import { getPgPool } from '../lib/postgres.js';
 
 const SESSION_UUID =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -200,6 +201,7 @@ async function verifyAndRepairScenarioDraft(
       'Rewrite the scenario so the steps are realistic and executable on this site.',
       'Keep the same goal. Update assertions to match what actually happens after prior actions.',
       'Do not return assumptions that are not visible or verifiable on the page.',
+      `URL integrity: Do NOT rewrite or "anonymize" domains (do not turn real domains into *.example). Keep URLs on the same site as this scenario's siteUrl: ${context.scenarioBase.siteUrl}`,
       narrativeRepair,
       'Realign the scenario with this page narrative: prefer the hero, primary CTA, and primary intent; remove or avoid steps that interact with demo or decorative sections unless the original user request explicitly required testing those.',
     ].join('\n');
@@ -520,6 +522,81 @@ router.get('/share-links/recent', async (req: Request, res: Response) => {
       sharePath: `/share/${l.token}`,
     }))
   );
+});
+
+/**
+ * Delete a whole site workspace for the current owner: scenarios (and their runs/artifacts via FK cascades),
+ * plus discovery/content-check history and share links for that site.
+ *
+ * "Site" is defined by normalized siteUrl (trailing slash removed).
+ */
+router.delete('/sites/:siteUrl', async (req: Request, res: Response) => {
+  let siteUrlDecoded: string;
+  try {
+    siteUrlDecoded = decodeURIComponent(req.params.siteUrl);
+  } catch {
+    return res.status(400).json({ error: 'Invalid site URL' });
+  }
+  const siteNorm = normalizeSiteUrlForMatch(siteUrlDecoded);
+
+  const owner = req.owner!;
+  const ownerType = owner.type === 'user' ? 'user' : 'anonymous';
+  const ownerId = owner.id;
+
+  const pool = getPgPool();
+  const deleted: {
+    scenarios: number;
+    discoveries: number;
+    contentChecks: number;
+    shareLinks: number;
+  } = { scenarios: 0, discoveries: 0, contentChecks: 0, shareLinks: 0 };
+
+  const scenariosRes = await pool.query(
+    `DELETE FROM scenarios
+     WHERE owner_type = $1 AND owner_id = $2
+       AND regexp_replace(site_url, '/$', '') = $3`,
+    [ownerType, ownerId, siteNorm]
+  );
+  deleted.scenarios = scenariosRes.rowCount ?? 0;
+
+  const discoveriesRes = await pool.query(
+    `DELETE FROM discoveries
+     WHERE owner_type = $1 AND owner_id = $2
+       AND regexp_replace(site_url, '/$', '') = $3`,
+    [ownerType, ownerId, siteNorm]
+  );
+  deleted.discoveries = discoveriesRes.rowCount ?? 0;
+
+  const contentRes = await pool.query(
+    `DELETE FROM content_checks
+     WHERE owner_type = $1 AND owner_id = $2
+       AND regexp_replace(site_url, '/$', '') = $3`,
+    [ownerType, ownerId, siteNorm]
+  );
+  deleted.contentChecks = contentRes.rowCount ?? 0;
+
+  if (owner.type === 'user') {
+    const shareRes = await pool.query(
+      `DELETE FROM site_share_links
+       WHERE owner_user_id = $1
+         AND regexp_replace(site_url, '/$', '') = $2`,
+      [owner.id, siteNorm]
+    );
+    deleted.shareLinks = shareRes.rowCount ?? 0;
+  }
+
+  emitTelemetry(
+    {
+      eventType: 'site_deleted',
+      siteUrl: siteNorm,
+      deleted,
+    },
+    'discovery',
+    'info',
+    { requestId: req.requestId, traceId: req.traceId }
+  );
+
+  res.json({ ok: true, siteUrl: siteNorm, deleted });
 });
 
 router.get('/scenarios', async (req: Request, res: Response) => {
