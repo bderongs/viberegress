@@ -180,6 +180,76 @@ function deleteSiteSession(key) {
   saveSiteSessionsBlob(blob);
 }
 
+function deleteSiteSessionsForSite(siteUrl) {
+  const targetKey = normalizeSiteKey(siteUrl);
+  if (!targetKey) return;
+  const blob = loadSiteSessionsBlob();
+  const keys = Object.keys(blob.sites || {});
+  for (const k of keys) {
+    const sess = blob.sites[k];
+    const keyMatches = normalizeSiteKey(k) === targetKey;
+    const sessionUrlMatches = sess && typeof sess.siteUrl === 'string' && normalizeSiteKey(sess.siteUrl) === targetKey;
+    if (keyMatches || sessionUrlMatches) delete blob.sites[k];
+  }
+  saveSiteSessionsBlob(blob);
+}
+
+function stripOneTrailingSlash(url) {
+  return (url || '').replace(/\/$/, '');
+}
+
+function getSiteDeleteCandidates(siteUrl) {
+  const out = new Set();
+  const add = (value) => {
+    const n = normalizeUrlInput(value);
+    if (!n) return;
+    out.add(stripOneTrailingSlash(n));
+  };
+
+  add(siteUrl);
+  const key = normalizeSiteKey(siteUrl);
+  add(key);
+
+  const sess = getSiteSession(key);
+  if (sess && sess.siteUrl) add(sess.siteUrl);
+
+  for (const s of scenarios) {
+    if (normalizeSiteKey(s.siteUrl) === key) add(s.siteUrl);
+  }
+
+  const base = [...out];
+  for (const u of base) {
+    try {
+      const parsed = new URL(u);
+      if (parsed.hostname.toLowerCase().startsWith('www.')) {
+        parsed.hostname = parsed.hostname.replace(/^www\./i, '');
+        add(parsed.toString());
+      } else {
+        parsed.hostname = `www.${parsed.hostname}`;
+        add(parsed.toString());
+      }
+    } catch (_) {}
+  }
+  return [...out];
+}
+
+function deletedRowCount(resp) {
+  if (!resp || typeof resp !== 'object' || !resp.deleted) return 0;
+  const d = resp.deleted;
+  return (d.scenarios || 0) + (d.discoveries || 0) + (d.contentChecks || 0) + (d.shareLinks || 0);
+}
+
+async function deleteSiteWorkspaceOnServer(siteUrl) {
+  const candidates = getSiteDeleteCandidates(siteUrl);
+  let last = null;
+  for (const candidate of candidates) {
+    const resp = await api('DELETE', '/sites/' + encodeURIComponent(candidate));
+    last = resp;
+    if (deletedRowCount(resp) > 0) return resp;
+  }
+  return last;
+}
+
 function migrateLegacyScanDraftOnce() {
   try {
     const raw = sessionStorage.getItem(LEGACY_SCAN_DRAFT_KEY);
@@ -498,33 +568,24 @@ function fillSitePreviewIntoDom(prefix, preview) {
 function readContentCheckInputFromUi() {
   if (isSiteDashboardViewActive()) {
     const p = $('site-dash-content-persona');
-    const inf = $('site-dash-content-infer-persona');
     if (p) {
       return {
         persona: (p.value || '').trim(),
-        inferPersona: !!(inf && inf.checked),
       };
     }
   }
   const p = $('content-check-persona');
-  const inf = $('content-check-infer-persona');
   return {
     persona: p ? (p.value || '').trim() : '',
-    inferPersona: inf ? inf.checked : false,
   };
 }
 
 function mirrorContentCheckInputsAcrossPanels(source) {
   const persona = source && typeof source.persona === 'string' ? source.persona : '';
-  const infer = !!(source && source.inferPersona);
   const p1 = $('content-check-persona');
-  const i1 = $('content-check-infer-persona');
   const p2 = $('site-dash-content-persona');
-  const i2 = $('site-dash-content-infer-persona');
   if (p1) p1.value = persona;
-  if (i1) i1.checked = infer;
   if (p2) p2.value = persona;
-  if (i2) i2.checked = infer;
 }
 
 function setContentCheckError(msg) {
@@ -546,7 +607,6 @@ function applyContentCheckSessionFromStore(sess) {
   const input = s.contentCheckInput && typeof s.contentCheckInput === 'object' ? s.contentCheckInput : {};
   mirrorContentCheckInputsAcrossPanels({
     persona: typeof input.persona === 'string' ? input.persona : '',
-    inferPersona: !!input.inferPersona,
   });
   contentCheckResult =
     s.contentCheckResult && typeof s.contentCheckResult === 'object'
@@ -1121,14 +1181,9 @@ function initWelcomePersonaCardUi() {
         sitePreviewResult.likelyTargetPersonaValidated = true;
         if (!sitePreviewResult.likelyTargetPersonaSource) sitePreviewResult.likelyTargetPersonaSource = 'auto';
       }
-      mirrorContentCheckInputsAcrossPanels({ persona, inferPersona: false });
+      mirrorContentCheckInputsAcrossPanels({ persona });
       fillSitePreviewIntoDom('site-preview', sitePreviewResult);
       syncSiteSessionFromUi();
-      // Lightweight UI feedback: disable inference toggles since a persona is now set.
-      const i1 = $('content-check-infer-persona');
-      const i2 = $('site-dash-content-infer-persona');
-      if (i1) i1.checked = false;
-      if (i2) i2.checked = false;
     });
   }
 
@@ -1359,8 +1414,8 @@ function bindShareUi() {
 async function deleteSelectedSiteWorkspace() {
   if (!selectedSiteUrl) return;
   const siteUrl = selectedSiteUrl;
-  const siteScenarioCount = scenarios.filter(s => (s.siteUrl || '') === siteUrl).length;
   const key = normalizeSiteKey(siteUrl);
+  const siteScenarioCount = scenarios.filter((s) => normalizeSiteKey(s.siteUrl || '') === key).length;
 
   const msg =
     `Delete this site workspace?\n\n` +
@@ -1374,18 +1429,18 @@ async function deleteSelectedSiteWorkspace() {
 
   showOverlay('Deleting site…');
   try {
-    await api('DELETE', '/sites/' + encodeURIComponent(siteUrl));
-    deleteSiteSession(key);
+    await deleteSiteWorkspaceOnServer(siteUrl);
+    deleteSiteSessionsForSite(siteUrl);
     if (activeSiteSessionKey === key) activeSiteSessionKey = null;
     try {
       const last = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
       if (last === key) localStorage.removeItem(LAST_ACTIVE_SITE_KEY);
     } catch (_) {}
 
-    if (activeScenarioId && scenarios.some(s => s.id === activeScenarioId && (s.siteUrl || '') === siteUrl)) {
+    if (activeScenarioId && scenarios.some((s) => s.id === activeScenarioId && normalizeSiteKey(s.siteUrl || '') === key)) {
       activeScenarioId = null;
     }
-    if (selectedSiteUrl === siteUrl) selectedSiteUrl = null;
+    if (normalizeSiteKey(selectedSiteUrl || '') === key) selectedSiteUrl = null;
 
     await loadScenarios();
     renderSidebarList();
@@ -1931,7 +1986,7 @@ function renderSidebarList() {
           <span class="site-hostname site-open-link" role="button" tabindex="0" onclick="event.stopPropagation(); activateSiteWorkspace('${esc(displayUrl)}', true)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();activateSiteWorkspace('${esc(displayUrl)}', true)}">${escapeHtml(hostname)}</span>
           ${inProgress && !items.length ? '<span class="site-draft-badge" title="Scan in progress">···</span>' : ''}
           <span class="site-count">${items.length}</span>
-          <button type="button" class="site-delete-btn" title="Delete site workspace" onclick="event.stopPropagation(); deleteSiteWorkspace('${esc(displayUrl)}')">×</button>
+          <button type="button" class="site-delete-btn" title="Delete site workspace" aria-label="Delete site workspace" onclick="event.stopPropagation(); deleteSiteWorkspace('${esc(displayUrl)}')">x</button>
         </div>
         ${isOpen ? `<ul class="site-scenarios">
           ${
@@ -1957,8 +2012,8 @@ function renderSidebarList() {
 
 async function deleteSiteWorkspace(siteUrl) {
   if (!siteUrl) return;
-  const siteScenarioCount = scenarios.filter(s => (s.siteUrl || '') === siteUrl).length;
   const key = normalizeSiteKey(siteUrl);
+  const siteScenarioCount = scenarios.filter((s) => normalizeSiteKey(s.siteUrl || '') === key).length;
 
   const msg =
     `Delete this site workspace?\n\n` +
@@ -1972,19 +2027,19 @@ async function deleteSiteWorkspace(siteUrl) {
 
   showOverlay('Deleting site…');
   try {
-    await api('DELETE', '/sites/' + encodeURIComponent(siteUrl));
+    await deleteSiteWorkspaceOnServer(siteUrl);
 
-    deleteSiteSession(key);
+    deleteSiteSessionsForSite(siteUrl);
     if (activeSiteSessionKey === key) activeSiteSessionKey = null;
     try {
       const last = localStorage.getItem(LAST_ACTIVE_SITE_KEY);
       if (last === key) localStorage.removeItem(LAST_ACTIVE_SITE_KEY);
     } catch (_) {}
 
-    if (activeScenarioId && scenarios.some(s => s.id === activeScenarioId && (s.siteUrl || '') === siteUrl)) {
+    if (activeScenarioId && scenarios.some((s) => s.id === activeScenarioId && normalizeSiteKey(s.siteUrl || '') === key)) {
       activeScenarioId = null;
     }
-    if (selectedSiteUrl === siteUrl) selectedSiteUrl = null;
+    if (normalizeSiteKey(selectedSiteUrl || '') === key) selectedSiteUrl = null;
 
     await loadScenarios();
     renderSidebarList();
@@ -2875,9 +2930,18 @@ $('btn-welcome-content').onclick = () => {
   const sub = $('content-check-url');
   if (sub) sub.textContent = sitePreviewResult.resolvedUrl || sitePreviewResult.siteUrl || '';
   fillSitePreviewIntoDom('content-check-preview', sitePreviewResult);
+  const previewPersona =
+    sitePreviewResult && sitePreviewResult.likelyTargetPersona
+      ? String(sitePreviewResult.likelyTargetPersona).trim()
+      : '';
+  const current = readContentCheckInputFromUi();
+  if (!current.persona && previewPersona) {
+    mirrorContentCheckInputsAcrossPanels({ persona: previewPersona });
+  }
   setContentCheckError('');
   showView('contentCheck');
   syncSiteSessionFromUi();
+  void runContentCheckRequest();
 };
 
 $('btn-content-check-back').onclick = () => {
@@ -2902,7 +2966,15 @@ async function runContentCheckRequest() {
     );
     return;
   }
-  const { persona, inferPersona } = readContentCheckInputFromUi();
+  const { persona } = readContentCheckInputFromUi();
+  const previewPersona =
+    sitePreviewResult && sitePreviewResult.likelyTargetPersona
+      ? String(sitePreviewResult.likelyTargetPersona).trim()
+      : '';
+  const effectivePersona = persona || previewPersona;
+  if (effectivePersona && effectivePersona !== persona) {
+    mirrorContentCheckInputsAcrossPanels({ persona: effectivePersona });
+  }
   const authProfileId = $('scan-auth-profile')?.value || undefined;
   const headless = $('scan-headless') ? $('scan-headless').checked : true;
   setContentCheckError('');
@@ -2916,8 +2988,7 @@ async function runContentCheckRequest() {
       url: urlRaw,
       headless,
       ...(authProfileId && { authProfileId }),
-      ...(persona ? { persona } : {}),
-      inferPersona,
+      ...(effectivePersona ? { persona: effectivePersona } : {}),
     });
     renderContentCheckReport(contentCheckResult);
     syncSiteSessionFromUi();
@@ -2943,17 +3014,9 @@ const contentPersonaEl = $('content-check-persona');
 if (contentPersonaEl) {
   contentPersonaEl.addEventListener('input', () => schedulePersistWelcomeScanDraft());
 }
-const contentInferEl = $('content-check-infer-persona');
-if (contentInferEl) {
-  contentInferEl.addEventListener('change', () => persistWelcomeScanDraft());
-}
 const siteDashPersonaEl = $('site-dash-content-persona');
 if (siteDashPersonaEl) {
   siteDashPersonaEl.addEventListener('input', () => schedulePersistWelcomeScanDraft());
-}
-const siteDashInferEl = $('site-dash-content-infer-persona');
-if (siteDashInferEl) {
-  siteDashInferEl.addEventListener('change', () => persistWelcomeScanDraft());
 }
 
 $('scan-url').addEventListener('keydown', e => {

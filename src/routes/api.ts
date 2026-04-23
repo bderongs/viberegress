@@ -1063,12 +1063,11 @@ router.post('/content-check', async (req: Request, res: Response) => {
   if (!isContentCheckEnabled()) {
     return res.status(503).json({ error: 'Content check is temporarily disabled.' });
   }
-  const { url, headless, authProfileId, persona, inferPersona, maxExtraPages } = req.body as {
+  const { url, headless, authProfileId, persona, maxExtraPages } = req.body as {
     url?: string;
     headless?: boolean;
     authProfileId?: string;
     persona?: string;
-    inferPersona?: boolean;
     maxExtraPages?: number;
   };
   if (!url || typeof url !== 'string') return res.status(400).json({ error: 'url is required' });
@@ -1083,7 +1082,6 @@ router.post('/content-check', async (req: Request, res: Response) => {
   }
 
   const headlessOpt = headless !== undefined ? headless : true;
-  const infer = inferPersona === true;
   let maxExtra = 3;
   if (typeof maxExtraPages === 'number' && Number.isFinite(maxExtraPages)) {
     maxExtra = Math.floor(maxExtraPages);
@@ -1102,7 +1100,6 @@ router.post('/content-check', async (req: Request, res: Response) => {
         headless: headlessOpt,
         authProfileId: authProfileId ?? null,
         persona: persona ?? null,
-        inferPersona: infer,
         maxExtraPages: maxExtra,
       }),
       resultJson: null,
@@ -1119,7 +1116,6 @@ router.post('/content-check', async (req: Request, res: Response) => {
       siteUrl: url.trim(),
       headless: headlessOpt,
       authProfileId: authProfileId ?? null,
-      inferPersona: infer,
     },
     'discovery',
     'info',
@@ -1132,7 +1128,6 @@ router.post('/content-check', async (req: Request, res: Response) => {
       authProfileId: authProfileId || undefined,
       owner: req.owner!,
       persona: typeof persona === 'string' ? persona : undefined,
-      inferPersona: infer,
       maxExtraPages: maxExtra,
       requestId: req.requestId,
       traceId: req.traceId,

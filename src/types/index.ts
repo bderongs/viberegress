@@ -129,7 +129,7 @@ export interface DiscoveryResult {
 export interface ContentCheckPersonaUsed {
   /** Effective persona description used for judgment. */
   text: string;
-  source: 'user' | 'inferred';
+  source: 'user' | 'default';
   /** 0–1; 1 when user supplied text. */
   confidence: number;
 }
@@ -238,14 +238,13 @@ export type DiscoveryEventPayload =
       siteUrl: string;
       headless: boolean;
       authProfileId?: string | null;
-      inferPersona: boolean;
     }
   | {
       eventType: 'content_check_completed';
       siteUrl: string;
       resolvedHomeUrl: string;
       pageCount: number;
-      personaSource: 'user' | 'inferred';
+      personaSource: 'user' | 'default';
       durationMs: number;
       crawlErrorCount?: number;
     }

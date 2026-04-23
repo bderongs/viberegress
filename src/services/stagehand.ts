@@ -2127,7 +2127,6 @@ export async function runContentCheck(
     authProfileId?: string;
     owner?: Owner;
     persona?: string;
-    inferPersona?: boolean;
     maxExtraPages?: number;
     requestId?: string;
     traceId?: string;
@@ -2188,29 +2187,9 @@ export async function runContentCheck(
 
     if (personaTrim) {
       personaUsed = { text: personaTrim, source: 'user', confidence: 1 };
-    } else if (options?.inferPersona) {
-      try {
-        const inferred = (await pwPage.extract({
-          instruction: `From this page's visible positioning only, infer ONE short primary user persona (role + goal in one or two sentences) who this homepage most clearly targets. If unclear, say so. Return confidence 0-1.`,
-          schema: z.object({
-            personaDescription: z.string(),
-            confidence: z.number(),
-          }),
-          iframes: true,
-        })) as { personaDescription: string; confidence: number };
-        const text = (inferred.personaDescription || '').trim() || DEFAULT_CONTENT_PERSONA;
-        const conf =
-          typeof inferred.confidence === 'number' && inferred.confidence >= 0 && inferred.confidence <= 1
-            ? inferred.confidence
-            : 0.5;
-        personaUsed = { text, source: 'inferred', confidence: conf };
-      } catch (err) {
-        crawlErrors.push(`persona_infer_failed: ${err instanceof Error ? err.message : String(err)}`);
-        personaUsed = { text: DEFAULT_CONTENT_PERSONA, source: 'inferred', confidence: 0.35 };
-      }
     } else {
-      // No user text and inference off: neutral default (explicit low confidence).
-      personaUsed = { text: DEFAULT_CONTENT_PERSONA, source: 'inferred', confidence: 0.35 };
+      // No explicit persona passed from UI; fall back to neutral baseline.
+      personaUsed = { text: DEFAULT_CONTENT_PERSONA, source: 'default', confidence: 0.35 };
     }
 
     if (withinBudget() && maxExtra > 0) {

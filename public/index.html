@@ -201,12 +201,8 @@
             <p class="panel-label">Persona and run</p>
             <p class="hint content-check-disclaimer">This is an advisory read of copy and UX for a persona — not a regression pass/f gate. Use <strong>Discover scenarios</strong> for saved journeys.</p>
             <label class="content-check-label" for="content-check-persona">Persona (optional)</label>
-            <p class="hint content-check-label-hint">Describe who is reading the site (e.g. role, goals). Leave empty for a neutral visitor unless you enable inference below.</p>
+            <p class="hint content-check-label-hint">Describe who is reading the site (e.g. role, goals). If empty, we use the persona from homepage preview/discovery when available.</p>
             <textarea id="content-check-persona" class="content-check-persona-input" rows="3" placeholder="e.g. A small-business owner comparing pricing before signing up…" spellcheck="true"></textarea>
-            <label class="content-check-infer-wrap">
-              <input type="checkbox" id="content-check-infer-persona" />
-              <span>Infer persona from the homepage</span>
-            </label>
             <div class="content-check-actions">
               <button type="button" class="btn-primary" id="btn-content-check-run">Run content check</button>
             </div>
@@ -352,12 +348,8 @@
             <div class="panel site-dash-content-panel">
               <p class="panel-label">Persona and run</p>
               <label class="content-check-label" for="site-dash-content-persona">Persona (optional)</label>
-              <p class="hint content-check-label-hint">Who is reading the site (role, goals). Leave empty for a neutral visitor unless you infer from the homepage.</p>
+              <p class="hint content-check-label-hint">Who is reading the site (role, goals). If empty, we reuse the persona from homepage preview/discovery when available.</p>
               <textarea id="site-dash-content-persona" class="content-check-persona-input" rows="3" placeholder="e.g. A founder comparing plans before upgrade…" spellcheck="true"></textarea>
-              <label class="content-check-infer-wrap">
-                <input type="checkbox" id="site-dash-content-infer-persona" />
-                <span>Infer persona from the homepage</span>
-              </label>
               <div class="content-check-actions">
                 <button type="button" class="btn-primary" id="btn-site-dash-content-run">Run content check</button>
               </div>
